@@ -1,0 +1,6 @@
+name = "gemini-proxy"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+TARGET = "https://gemini-web2api.shigatsuki.workers.dev"

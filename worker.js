@@ -1616,6 +1616,10 @@ export default {
         return jsonResponse({ error: "not found" }, 404);
       }
 
+      if (method === "HEAD") {
+        return jsonResponse({ status: "ok", version: VERSION });
+      }
+
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {
       log(cfg, `error: ${(e && e.stack) || e}`);
