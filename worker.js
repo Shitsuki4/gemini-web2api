@@ -28,6 +28,10 @@
  *   DEFAULT_MODEL        默认模型名
  *   RETRY_ATTEMPTS / RETRY_DELAY_SEC / REQUEST_TIMEOUT_SEC   整数
  *   LOG_REQUESTS         true/false
+ *   AUTH_USER            Google 多账号序号;留空=默认账号,否则走 /u/{n} 前缀
+ *   XSRF_TOKEN           可选,SNlM0e at-token;payload 加 at= 参数
+ *   TEMPORARY_CHATS      true/false;true=临时会话(不落历史)
+ *   AUTO_UPDATE_BL       true/false;上游 405 时自动抓最新 GEMINI_BL 重试
  *
  * 限制:图片/多模态输入需要登录态 —— 设置了 GEMINI_COOKIE 时,图片会经 Scotty
  * 上传到 Gemini 再绑进会话;未设置 cookie 时图片会被忽略(匿名带图会被后端以
@@ -35,7 +39,7 @@
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
-const VERSION = "1.1.0-worker";
+const VERSION = "1.2.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -55,7 +59,7 @@ const CONFIG = {
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
-  GEMINI_BL: "boq_assistant-bard-web-server_20260525.09_p0",
+  GEMINI_BL: "boq_assistant-bard-web-server_20260716.08_p0",
 
   // 上游源站。默认直连 gemini.google.com。若部署在 Cloudflare/无服务器平台
   // 被 Google 以 429 限流(出口 IP 被拦),把它指向一个跑在“干净 IP”上的反向
@@ -67,7 +71,20 @@ const CONFIG = {
   // true=优先 socket,不可用/失败再回退 fetch;false=只用 fetch。
   UPSTREAM_SOCKET: true,
 
-  DEFAULT_MODEL: "gemini-3.5-flash",
+  // Google 多账号:留空用默认账号;填序号(如 "1")走 /u/1 路径前缀。
+  AUTH_USER: "",
+
+  // 可选的 XSRF token(页面源码 "SNlM0e":"...");设置后 payload 带 at= 参数,
+  // 某些风控严格的环境需要。
+  XSRF_TOKEN: "",
+
+  // true=所有请求按“临时会话”发送(Gemini 不保存历史)。
+  TEMPORARY_CHATS: false,
+
+  // 上游返回 405(常见于 BL 过期)时,自动抓取最新构建号并重试一次。
+  AUTO_UPDATE_BL: true,
+
+  DEFAULT_MODEL: "gemini-3.6-flash",
   RETRY_ATTEMPTS: 3,
   RETRY_DELAY_SEC: 2,
   REQUEST_TIMEOUT_SEC: 180,
@@ -78,7 +95,9 @@ const CONFIG = {
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
 //   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 const MODELS = {
-  "gemini-3.5-flash": { mode: 1, think: 4, desc: "Fast general-purpose model" },
+  "gemini-3.7-flash": { mode: 1, think: 4, desc: "Latest all-around model (Gemini 3.7 Flash)" },
+  "gemini-3.6-flash": { mode: 1, think: 4, desc: "All-around model (Gemini 3.6 Flash)" },
+  "gemini-3.5-flash": { mode: 1, think: 4, desc: "Alias for gemini-3.6-flash (backend upgraded)" },
   "gemini-3.5-flash-thinking": { mode: 2, think: 0, desc: "Deep thinking mode, longest output (~20k chars)" },
   "gemini-3.1-pro": { mode: 3, think: 4, desc: "Pro model (requires cookie for real routing)" },
   "gemini-3.1-pro-enhanced": { mode: 3, think: 4, extra: { 31: 2, 80: 3 }, desc: "Pro with enhanced output (experimental)" },
@@ -170,6 +189,10 @@ function getConfig(env) {
     retry_delay_sec: parseIntDefault(envOr(env, "RETRY_DELAY_SEC", CONFIG.RETRY_DELAY_SEC), 2),
     request_timeout_sec: parseIntDefault(envOr(env, "REQUEST_TIMEOUT_SEC", CONFIG.REQUEST_TIMEOUT_SEC), 180),
     log_requests: parseBool(envOr(env, "LOG_REQUESTS", CONFIG.LOG_REQUESTS), true),
+    auth_user: String(envOr(env, "AUTH_USER", CONFIG.AUTH_USER) || "").replace(/^\/+|\/+$/g, ""),
+    xsrf_token: envOr(env, "XSRF_TOKEN", CONFIG.XSRF_TOKEN) || "",
+    temporary_chats: parseBool(envOr(env, "TEMPORARY_CHATS", CONFIG.TEMPORARY_CHATS), false),
+    auto_update_bl: parseBool(envOr(env, "AUTO_UPDATE_BL", CONFIG.AUTO_UPDATE_BL), true),
     api_keys: parseApiKeys(envOr(env, "API_KEYS", CONFIG.API_KEYS)),
     cookie,
     sapisid,
@@ -245,7 +268,12 @@ function tokenEst(s) {
  * 构造 f.req 表单体。`inner` 是一个 102 槽的数组,对应 Gemini 网页前端发送的
  * 字段;字段 [79] 用于选择模型(MODE_CATEGORY)。
  */
-function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
+// 非默认 Google 账号的路径前缀("" 或 "/u/1" 等)。
+function accountPrefix(cfg) {
+  return cfg.auth_user ? `/u/${cfg.auth_user}` : "";
+}
+
+function buildPayload(prompt, modelId, thinkMode, fileRefs, extra, cfg) {
   const inner = new Array(102).fill(null);
   if (fileRefs && fileRefs.length) {
     // 每个上传文件表示为 [[fileRef, 1], filename](格式来自 gemini_webapi,
@@ -265,7 +293,13 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
   inner[18] = 0;
   inner[27] = 1;
   inner[30] = [4];
-  inner[41] = [2];
+  // 会话持久化标志(对齐上游):临时会话 inner[41]=[1], inner[45]=1;否则 [2]。
+  if (cfg && cfg.temporary_chats) {
+    inner[41] = [1];
+    inner[45] = 1;
+  } else {
+    inner[41] = [2];
+  }
   inner[53] = 0;
   inner[59] = uuid();
   inner[61] = [];
@@ -275,14 +309,16 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
     for (const k of Object.keys(extra)) inner[Number(k)] = extra[k];
   }
   const outer = [null, JSON.stringify(inner)];
-  return new URLSearchParams({ "f.req": JSON.stringify(outer) }).toString();
+  const form = { "f.req": JSON.stringify(outer) };
+  if (cfg && cfg.xsrf_token) form.at = cfg.xsrf_token;
+  return new URLSearchParams(form).toString();
 }
 
 function getUrl(cfg) {
   const reqid = nowSec() % 1000000;
   const origin = (cfg.gemini_origin || "https://gemini.google.com").replace(/\/$/, "");
   return (
-    origin +
+    origin + accountPrefix(cfg) +
     "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate" +
     `?bl=${encodeURIComponent(cfg.gemini_bl)}&hl=en&_reqid=${reqid}&rt=c`
   );
@@ -292,10 +328,11 @@ async function buildHeaders(cfg) {
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded",
     "Origin": "https://gemini.google.com",
-    "Referer": "https://gemini.google.com/app",
+    "Referer": `https://gemini.google.com${accountPrefix(cfg)}/app`,
     "X-Same-Domain": "1",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   };
+  if (cfg.auth_user) headers["X-Goog-AuthUser"] = cfg.auth_user;
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   return headers;
@@ -453,6 +490,34 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
   return fetch(url, { method, headers, body, signal: timeoutSignal(timeoutMs) });
 }
 
+// ─── BL 自动更新(405 过期时兜底)─────────────────────────────────────────
+// 从 /app 页面源码抓最新 boq 构建号;成功且不同则更新 cfg.gemini_bl 并返回 true。
+async function fetchLatestBl(cfg) {
+  try {
+    const origin = (cfg.gemini_origin || "https://gemini.google.com").replace(/\/$/, "");
+    const headers = { "User-Agent": _UA };
+    if (cfg.cookie) headers["Cookie"] = cfg.cookie;
+    const resp = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, { headers, timeoutMs: 15000, socket: cfg.upstream_socket });
+    const html = await resp.text();
+    const m = /(boq_assistant-bard-web-server_\d+\.\d+_p\d+)/.exec(html);
+    return m ? m[1] : null;
+  } catch (e) {
+    log(cfg, `BL auto-update fetch failed: ${e}`);
+    return null;
+  }
+}
+
+async function updateBlIfNeeded(cfg) {
+  if (!cfg.auto_update_bl) return false;
+  const newBl = await fetchLatestBl(cfg);
+  if (newBl && newBl !== cfg.gemini_bl) {
+    log(cfg, `BL auto-updated: ${cfg.gemini_bl} -> ${newBl}`);
+    cfg.gemini_bl = newBl;
+    return true;
+  }
+  return false;
+}
+
 // ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
 // 说明:图片输入需要登录态(GEMINI_COOKIE)。匿名会话上传文件能成功,但带图
 // 生成会被后端以 BardErrorInfo[1100] 拒绝(权限门)。无 cookie 时不上传,
@@ -460,6 +525,14 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 
 const _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 let _pageTokens = { tokens: null, ts: 0 };
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
+  return btoa(bin);
+}
 
 function base64ToBytes(b64) {
   const bin = atob(b64);
@@ -471,8 +544,21 @@ function base64ToBytes(b64) {
 // 解析 OpenAI image_url:data:URL(base64)或 http(s) URL。返回 {b64,mime} 或 {url} 或 null。
 function parseImageUrl(url) {
   if (!url || typeof url !== "string") return null;
-  const m = /^data:([^;,]+);base64,([\s\S]*)$/.exec(url);
-  if (m) return { b64: m[2], mime: m[1] || "image/png" };
+  if (url.startsWith("data:")) {
+    const comma = url.indexOf(",");
+    if (comma < 0) return null;
+    const meta = url.slice(5, comma); // e.g. "image/png;base64" / "image/svg+xml;utf8"
+    const data = url.slice(comma + 1);
+    const mime = (meta.split(";")[0] || "image/png").toLowerCase();
+    if (meta.toLowerCase().endsWith(";base64")) return { b64: data, mime };
+    // 非 base64 的 data: URL(如 image/svg+xml;utf8,...):URL 解码成字节再转回 base64。
+    try {
+      const bytes = new TextEncoder().encode(decodeURIComponent(data));
+      return { b64: bytesToBase64(bytes), mime };
+    } catch (_) {
+      return null;
+    }
+  }
   if (/^https?:\/\//.test(url)) return { url };
   return null;
 }
@@ -599,7 +685,14 @@ function extractTextsFromLine(line) {
   }
 }
 
+// 上游以 BardErrorInfo[code] 拒绝时直接抛错,不再静默返回空。
+function checkBardError(raw) {
+  const m = /BardErrorInfo[^0-9]{0,20}(\d{3,5})/.exec(raw);
+  if (m) throw new Error(`Gemini upstream rejected request: BardErrorInfo [${m[1]}]`);
+}
+
 function extractResponseText(raw) {
+  checkBardError(raw);
   let lastText = "";
   for (const line of raw.split("\n")) {
     for (const t of extractTextsFromLine(line)) {
@@ -611,19 +704,29 @@ function extractResponseText(raw) {
 
 /** 非流式生成(带重试)。返回最终的响应文本。 */
 async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
-  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
-  const url = getUrl(cfg);
+  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra, cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
-      const resp = await httpFetch(url, {
+      if (cfg.client_ip) log(cfg, `client_ip=${cfg.client_ip} model generate request`);
+      let resp = await httpFetch(getUrl(cfg), {
         method: "POST",
         headers,
         body,
         timeoutMs: cfg.request_timeout_sec * 1000,
         socket: cfg.upstream_socket,
       });
+      if (resp.status === 405 && (await updateBlIfNeeded(cfg))) {
+        log(cfg, "Retrying with updated BL...");
+        resp = await httpFetch(getUrl(cfg), {
+          method: "POST",
+          headers,
+          body,
+          timeoutMs: cfg.request_timeout_sec * 1000,
+          socket: cfg.upstream_socket,
+        });
+      }
       const raw = await resp.text();
       const text = extractResponseText(raw);
       if (!resp.ok || !text) {
@@ -646,21 +749,40 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
 async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
-  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
-  const url = getUrl(cfg);
+  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra, cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
   let yielded = false;
+  let emittedRawText = ""; // 跨重试追踪已输出的原始文本,保证重试前缀一致
+  let loggedStart = false;
+
+  const logStart = () => {
+    if (!loggedStart && cfg.client_ip) {
+      loggedStart = true;
+      log(cfg, `client_ip=${cfg.client_ip} model stream request`);
+    }
+  };
 
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
-      const resp = await httpFetch(url, {
+      let resp = await httpFetch(getUrl(cfg), {
         method: "POST",
         headers,
         body,
         timeoutMs: cfg.request_timeout_sec * 1000,
         socket: cfg.upstream_socket,
       });
+      logStart();
+      if (resp.status === 405 && (await updateBlIfNeeded(cfg))) {
+        // BL 过期:更新后回退非流式拿完整文本
+        log(cfg, "BL updated on 405, falling back to non-streaming for this request");
+        const text = await generate(cfg, prompt, modelId, thinkMode, extra, fileRefs);
+        if (text) {
+          yielded = true;
+          yield text;
+        }
+        return;
+      }
       if (!resp.body) {
         const text = extractResponseText(await resp.text());
         if (text) {
@@ -676,12 +798,16 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
       let started = false; // 是否已 yield 过非空内容(用于裁掉开头的空白)
       const consumeLine = function* (line) {
         for (const t of extractTextsFromLine(line)) {
+          // 跨重试一致性:若与已输出文本不构成前缀关系,说明重试换了内容,直接报错。
+          if (t === emittedRawText || emittedRawText.startsWith(t)) continue;
+          if (!t.startsWith(emittedRawText)) throw new Error("Gemini stream content changed during retry");
           if (t.length > prev.length) {
             // 每段增量:去掉残留标记,但流式过程中不裁剪内部空白,
             // 以保留分块之间的空格(比如 "1, 2, 3" 而不是 "1, 2,3")。
             // 在首个可见内容出现前,持续裁掉前导空白(避免开头空行)。
             let delta = stripArtifacts(t.slice(prev.length));
             prev = t;
+            emittedRawText = t;
             if (!started) delta = delta.replace(/^\s+/, "");
             if (delta) {
               started = true;
@@ -694,6 +820,7 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
+        if (buf.includes("BardErrorInfo")) checkBardError(buf);
         let idx;
         while ((idx = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, idx);
@@ -737,7 +864,11 @@ function buildToolChoiceInstruction(toolChoice) {
   return "";
 }
 
-/** OpenAI messages -> [promptString, images]。images 恒为 [](不支持图片输入)。 */
+// Gemini 网页端 payload 上限约 60KB;工具块超过一半时裁剪 parameters,
+// 防止 100+ 工具的框架请求把用户消息静默截掉(上游 issue #74)。
+const PROMPT_MAX_BYTES = 60000;
+
+/** OpenAI messages -> [promptString, images]。 */
 function messagesToPrompt(messages, tools, toolChoice) {
   const parts = [];
   const images = [];
@@ -753,13 +884,18 @@ function messagesToPrompt(messages, tools, toolChoice) {
       });
     }
     if (toolDefs.length) {
+      let toolsJson = JSON.stringify(toolDefs, null, 2);
+      if (toolsJson.length > PROMPT_MAX_BYTES / 2) {
+        const slim = toolDefs.map((t) => ({ name: t.name, description: t.description }));
+        toolsJson = JSON.stringify(slim, null, 2);
+      }
       const constraint = buildToolChoiceInstruction(toolChoice);
       parts.push(
         "# Tool Use\n\n" +
           "You can call the following tools. Call format:\n" +
           '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n' +
           "When calling tools, output ONLY the tool_call block(s).\n\n" +
-          `Available tools:\n${JSON.stringify(toolDefs, null, 2)}` +
+          `Available tools:\n${toolsJson}` +
           constraint
       );
     }
@@ -778,14 +914,33 @@ function messagesToPrompt(messages, tools, toolChoice) {
         } else if (t === "image_url") {
           const u = c.image_url && (c.image_url.url || c.image_url);
           const img = parseImageUrl(typeof u === "string" ? u : "");
-          if (img) images.push(img);
+          if (img) {
+            images.push(img);
+            textParts.push("[Image attached]");
+          }
+        } else if (t === "input_image") {
+          // OpenAI Responses 风格:{type:"input_image", image_url} 或 {data/base64}
+          const u = c.image_url && (c.image_url.url || c.image_url);
+          let img = u ? parseImageUrl(typeof u === "string" ? u : "") : null;
+          if (!img) {
+            const data = c.data || c.base64;
+            if (data) img = parseImageUrl(String(data)) || { b64: String(data), mime: c.mime_type || "image/png" };
+          }
+          if (img) {
+            images.push(img);
+            textParts.push("[Image attached]");
+          }
         } else if (t === "image") {
           // 兼容 Anthropic 风格 {source:{type:"base64",media_type,data}}
           if (c.source && c.source.data) {
             images.push({ b64: c.source.data, mime: c.source.media_type || "image/png" });
+            textParts.push("[Image attached]");
           } else if (c.image_url) {
             const img = parseImageUrl(typeof c.image_url === "string" ? c.image_url : c.image_url.url || "");
-            if (img) images.push(img);
+            if (img) {
+              images.push(img);
+              textParts.push("[Image attached]");
+            }
           }
         }
       }
@@ -1039,7 +1194,7 @@ const EMPTY_UPSTREAM_MSG =
   "Run `wrangler tail` to see the upstream status.";
 
 // POST /v1/chat/completions
-async function handleChat(req, cfg) {
+async function handleChat(req, cfg, request) {
   const rm = resolveModel(req.model || cfg.default_model, cfg.default_model);
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
 
@@ -1061,6 +1216,7 @@ async function handleChat(req, cfg) {
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
+      chunk({ role: "assistant" }, null); // 严格 OpenAI SDK 兼容:首块带 role
       try {
         for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
           got = true;
@@ -1122,8 +1278,14 @@ async function handleChat(req, cfg) {
   });
 }
 
+// 从请求头提取客户端 IP(Cloudflare 环境用 cf-connecting-ip)。
+function clientIp(request) {
+  if (!request || !request.headers) return "";
+  return request.headers.get("cf-connecting-ip") || (request.headers.get("x-forwarded-for") || "").split(",")[0].trim() || "";
+}
+
 // POST /v1/responses(Codex CLI 用)
-async function handleResponses(req, cfg) {
+async function handleResponses(req, cfg, request) {
   const rm = resolveModel(req.model || cfg.default_model, cfg.default_model);
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
 
@@ -1141,6 +1303,8 @@ async function handleResponses(req, cfg) {
       } else if (item && typeof item === "object") {
         if (item.type === "function_call_output") {
           messages.push({ role: "tool", tool_call_id: item.call_id || "", name: item.name || "", content: item.output || "" });
+        } else if (["input_text", "input_image", "image"].includes(item.type)) {
+          messages.push({ role: "user", content: [item] });
         } else if (item.role === "assistant" || (item.type === "message" && item.role === "assistant")) {
           const cp = item.content != null ? item.content : [];
           let textAcc = "";
@@ -1219,18 +1383,32 @@ async function handleResponses(req, cfg) {
 
   if (req.stream) {
     return sseResponse(async (write) => {
-      write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: rid, object: "response", status: "in_progress", model: rm.name, output: [] } })}\n\n`);
-      for (const item of output) {
+      // 完整 OpenAI Responses 事件序列(对齐上游,兼容 Codex CLI 等严格客户端)
+      let seq = 0;
+      const emit = (type, fields) =>
+        write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: ++seq, ...fields })}\n\n`);
+      const baseResponse = { id: rid, object: "response", created_at: nowSec(), model: rm.name };
+      emit("response.created", { response: { ...baseResponse, status: "in_progress", output: [], usage: null } });
+      emit("response.in_progress", { response: { ...baseResponse, status: "in_progress", output: [], usage: null } });
+      output.forEach((item, outputIndex) => {
         if (item.type === "function_call") {
-          write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: item.id, call_id: item.call_id, name: item.name, arguments: item.arguments })}\n\n`);
+          emit("response.output_item.added", { output_index: outputIndex, item: { type: "function_call", id: item.id, call_id: item.call_id, name: item.name, arguments: "", status: "in_progress" } });
+          emit("response.function_call_arguments.delta", { item_id: item.id, output_index: outputIndex, delta: item.arguments });
+          emit("response.function_call_arguments.done", { item_id: item.id, output_index: outputIndex, arguments: item.arguments });
+          emit("response.output_item.done", { output_index: outputIndex, item });
         } else if (item.type === "message") {
+          emit("response.output_item.added", { output_index: outputIndex, item: { type: "message", id: item.id, role: "assistant", status: "in_progress", content: [] } });
           item.content.forEach((cp, ci) => {
-            write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: item.id, content_index: ci, text: cp.text })}\n\n`);
+            const ef = { item_id: item.id, output_index: outputIndex, content_index: ci };
+            emit("response.content_part.added", { ...ef, part: { type: "output_text", text: "", annotations: [] } });
+            emit("response.output_text.delta", { ...ef, delta: cp.text });
+            emit("response.output_text.done", { ...ef, text: cp.text });
+            emit("response.content_part.done", { ...ef, part: cp });
           });
+          emit("response.output_item.done", { output_index: outputIndex, item });
         }
-      }
-      const respObj = { id: rid, object: "response", status: "completed", model: rm.name, output, usage };
-      write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: respObj })}\n\n`);
+      });
+      emit("response.completed", { response: { ...baseResponse, status: "completed", output, usage } });
     });
   }
 
@@ -1238,7 +1416,7 @@ async function handleResponses(req, cfg) {
 }
 
 // POST /v1beta/models/{model}:generateContent | :streamGenerateContent
-async function handleGoogleGenerate(req, cfg, path, stream) {
+async function handleGoogleGenerate(req, cfg, path, stream, request) {
   const m = /\/v1beta\/models\/([^:?]+)/.exec(path);
   const rm = resolveModel(m ? m[1] : cfg.default_model, cfg.default_model);
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
@@ -1307,7 +1485,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
 // GET /debug — 排查上游为何为空。从【当前部署环境】实地探测,回显原始状态/片段。
 // 探针 A:裸请求(现行做法);探针 B:先抓访客 cookie + at token 再请求。
 // 对比两者即可判断:是 IP 被拦(都空)、还是缺会话(B 能通 → 可自动修)。
-async function handleDebug(cfg) {
+async function handleDebug(cfg, request) {
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
   async function probe(guest) {
@@ -1392,6 +1570,7 @@ export default {
     }
 
     try {
+      cfg.client_ip = clientIp(request);
       if (method === "GET") {
         if (path === "/v1/models") {
           return jsonResponse({
@@ -1408,7 +1587,7 @@ export default {
           return jsonResponse({ status: "ok", version: VERSION, models: Object.keys(MODELS) });
         }
         if (path === "/debug") {
-          return await handleDebug(cfg);
+          return await handleDebug(cfg, request);
         }
         return jsonResponse({ error: "not found" }, 404);
       }
@@ -1419,19 +1598,20 @@ export default {
 
         if (path === "/v1/chat/completions") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
-          return await handleChat(req, cfg);
+          return await handleChat(req, cfg, request);
         }
         if (path === "/v1/responses") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
-          return await handleResponses(req, cfg);
+          return await handleResponses(req, cfg, request);
+        }
+        // 注意:先匹配 :streamGenerateContent,避免含两个子串的路径被误判(对齐上游)
+        if (path.includes(":streamGenerateContent")) {
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleGoogleGenerate(req, cfg, path, true, request);
         }
         if (path.includes(":generateContent")) {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
-          return await handleGoogleGenerate(req, cfg, path, false);
-        }
-        if (path.includes(":streamGenerateContent")) {
-          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
-          return await handleGoogleGenerate(req, cfg, path, true);
+          return await handleGoogleGenerate(req, cfg, path, false, request);
         }
         return jsonResponse({ error: "not found" }, 404);
       }
@@ -1450,5 +1630,6 @@ export {
   extractTextsFromLine, extractResponseText, generate, generateStream,
   messagesToPrompt, parseToolCalls, googleContentsToPrompt, parseGoogleFunctionCalls,
   makeSapisidHash, parseImageUrl, getPageTokens, uploadImage, resolveImages,
+  accountPrefix, checkBardError, fetchLatestBl, updateBlIfNeeded, bytesToBase64, clientIp,
   __setConnect, httpFetch, socketHttp,
 };
