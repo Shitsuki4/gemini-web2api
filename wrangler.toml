@@ -1,3 +1,35 @@
 name = "gemini-web2api"
 main = "worker.js"
 compatibility_date = "2025-01-01"
+
+# 运行时状态:cookie / bl / xsrf 热更新(不用重新部署)
+[[kv_namespaces]]
+binding = "STATE"
+id = "80535d8c9ed94ec4a97d669848d3fbf7"
+
+# 多模态文件引用缓存(file_cache 表)
+[[d1_databases]]
+binding = "DB"
+database_name = "gemini-router-db"
+database_id = "ebaf9b4e-9ec1-4a52-a37a-3905f8267c50"
+
+# 每 6 小时:抓一次 Gemini 首页,把滚动更新的 __Secure-1PSIDTS/SNlM0e/bl 写回 KV
+[triggers]
+crons = ["7 */6 * * *"]
+
+[observability]
+enabled = true
+
+# 把 worker 调度到离上游(gemini.google.com)更近的机房:出口 IP 不再是本地
+# 就近的香港机房,图片生成等「按地区开放」的能力才拿得到。
+[placement]
+mode = "smart"
+
+# Regional Durable Object relay: locationHint chooses a non-HK egress region.
+[[durable_objects.bindings]]
+name = "EGRESS"
+class_name = "EgressRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EgressRelay"]
