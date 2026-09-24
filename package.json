@@ -1,0 +1,17 @@
+{
+  "name": "gemini-web2api-worker",
+  "version": "1.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers port of Google Gemini web to OpenAI/Google-compatible API",
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check worker.js && node --check proxy/worker.js",
+    "test": "node --test",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

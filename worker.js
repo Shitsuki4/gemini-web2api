@@ -627,6 +627,7 @@ function base64ToBytes(b64) {
 }
 function normalizeMimeType(mime, fallback = "image/png") {
   const m = String(mime || "").split(";")[0].trim().toLowerCase();
+  if (m === "image/jpg" || m === "image/pjpeg") return "image/jpeg";
   return m || fallback;
 }
 function detectImageMime(bytes, fallback = "image/png") {
@@ -657,9 +658,23 @@ function decodeDataUrl(url) {
   const isBase64 = metaParts.slice(1).some((x) => x.trim().toLowerCase() === "base64");
   try {
     if (isBase64) return { b64: data.replace(/\s+/g, ""), mime };
-    const bytes = new TextEncoder().encode(decodeURIComponent(data));
-    return { b64: bytesToBase64(bytes), mime };
+    return { b64: bytesToBase64(percentDecodeBytes(data)), mime };
   } catch (_) { return null; }
+}
+// 按字节解码 percent-encoding:%XX 直接取字节,其余字符按 UTF-8 编码。
+// 不能用 decodeURIComponent:它会按 UTF-8 解析 %89 之类的原始二进制字节并抛错。
+function percentDecodeBytes(str) {
+  const out = [];
+  const enc = new TextEncoder();
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === "%" && i + 2 < str.length + 1) {
+      const hex = str.slice(i + 1, i + 3);
+      if (/^[0-9a-fA-F]{2}$/.test(hex)) { out.push(parseInt(hex, 16)); i += 2; continue; }
+    }
+    for (const b of enc.encode(ch)) out.push(b);
+  }
+  return new Uint8Array(out);
 }
 // 解析 image_url:data:URL 或 http(s) URL。MIME 参数仅作兜底,
 // 真正上传前会按 magic bytes 修正。

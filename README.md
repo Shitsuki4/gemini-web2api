@@ -1,8 +1,8 @@
 # gemini-web2api (Cloudflare Worker)
 
-[Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api/) 的 Cloudflare Workers 移植版(单文件 `worker.js`)。已对齐上游 **2026-09-25 (`codex/openai-multimodal-support`, `4c934286`)** 的功能。
+> **独立项目**:本仓库不是 GitHub fork,而是一个独立维护的仓库(历史来自早期 fork,现已脱离 fork 关系)。参考上游 Python 版 [Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api/) 的能力,已在 Cloudflare Workers 上对齐到 **2026-09-25(`codex/openai-multimodal-support`, `4c934286`)** 并做了 Workers 侧增强(区域出口池、KV/D1 状态、SSRF 防护等)。
 
-将 Google Gemini 网页端转换为 OpenAI / Google 原生兼容 API。
+把 Google Gemini 网页端转换为 OpenAI / Google 原生兼容 API 的单文件 Cloudflare Worker(`worker.js`)。
 
 ## 特性
 
@@ -119,9 +119,21 @@
 
 逆向 Google Gemini 网页端的 StreamGenerate 协议,将 OpenAI API 格式与 Gemini 内部 protobuf-like 格式互转。模型选择通过请求 payload 的 `[79]` 字段控制,映射自 Gemini 前端 JS 的 `MODE_CATEGORY` 枚举。图片经 Scotty 续传接口上传换取文件引用,再随 payload 一起发送。
 
+## 开发与测试
+
+```bash
+npm test           # 单元测试(multimodal 解析 / MIME 嗅探 / SSRF 校验 / 工具调用解析)
+npm run check      # 语法检查 worker.js 与 proxy/worker.js
+npm run dev        # 本地 wrangler dev
+npm run deploy     # wrangler deploy
+```
+
+`tests/worker.test.mjs` 直接 import `worker.js` 里的纯函数,不联网、不需要 cookie。
+GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时跑 Node 20 与 22 的语法检查与单元测试。
+
 ## 致谢
-- [Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api/)(上游,功能基准)
-- [one880808/gemini-web2api](https://github.com/one880808/gemini-web2api)(本 fork 的源)
+- [Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api/)(上游 Python 版,功能基准)
+- [one880808/gemini-web2api](https://github.com/one880808/gemini-web2api)(本仓库的早期 fork 来源)
 - [linux.do](https://linux.do) 社区
 
 ## License
