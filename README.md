@@ -42,13 +42,18 @@
 
 Google 会按**出口 IP** 区别对待请求:有的直接 `BardErrorInfo[1060]`,有的 429/reCAPTCHA,图片生成更是普遍被拒。出口池把「出口」抽象成可切换、可打分、可排序的一等公民。
 
-三种出口:
+四种出口:
 
 ```ini
 direct                                   # 直接用 Worker 自带出口
 colo:weur                                # 经 EgressRelay Durable Object,落在该 Cloudflare 机房
 proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 https://)
+relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYIP 就是这种)
 ```
+
+`relay:` 假设中继按 **SNI** 决定往哪转,所以不需要 CONNECT/SOCKS 握手:连上中继后直接
+`startTls({ expectedServerHostname: 目标域名 })` 再讲 HTTPS。这正是不少「反代/中转 IP」
+类服务的工作方式。
 
 - 配置走 `EGRESS_POOL`,运行时可经 `/admin/egress` 热改(存 D1,强一致)。
 - **打分**:文本通 40 / 通但空 10 / 429(能连上、只是被限流)4 / 5xx 2 / 1060 或超时 0;能出图再 **+50**(图片才是真正卡人的指标);按延迟加 0~10 分。
@@ -156,7 +161,8 @@ proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 ht
 | `IMAGE_R2_STORE` / `IMAGE_R2_MONTHLY_MAX_BYTES` | 是否写 R2 / 月度写入上限(默认 4 GiB,留足 10 GB-月免费额度余量) |
 | `IMAGE_OBJECT_MAX_BYTES` | 单张超过此体积不落 R2(默认 12 MiB) |
 | `IMAGE_CACHE_TTL_SEC` / `IMAGE_PROXY_RATE_MAX` | 图片缓存时长(默认与 7 天生命周期对齐)/ `/img` 每 IP 每分钟限流 |
-| `EGRESS_POOL` | 出口池,逗号分隔:`colo:weur`、`proxy:socks5://user:pass@host:1080`、`direct`。留空则沿用 `EGRESS_HINT*`。运行时可经 `/admin/egress` 热改(存 D1) |
+| `SSE_HEARTBEAT_MS` | 流式响应的心跳间隔(默认 5000)。生成期间定期发 `: ping` 注释行,防止客户端(Android OkHttp 默认读超时 10s)在静默期报 "unexpected end of stream";0 = 关闭 |
+| `EGRESS_POOL` | 出口池,逗号分隔:`colo:weur`、`proxy:socks5://user:pass@host:1080`、`relay:host:443`(盲转发中继)、`direct`。留空则沿用 `EGRESS_HINT*`。运行时可经 `/admin/egress` 热改(存 D1) |
 | `EGRESS_FORCE` | 强制走某个出口(id 或 target);空 = 按纯净度分数自动择优 |
 | `EGRESS_PROBE_IMAGE` | 纯净度探测是否顺带试一次图片生成(会真的调上游) |
 
