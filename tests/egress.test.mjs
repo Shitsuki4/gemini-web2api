@@ -15,7 +15,7 @@ import {
 test("entryToSpec round-trips every kind through parseEgressSpec", () => {
   // 回归:出口池存进 D1 时 colo 的 target 只是 "weur",读回来必须能还原成
   // "colo:weur" —— 直接拿 target 去 parse 会全部解析失败、静默退回默认池。
-  for (const spec of ["direct", "colo:weur", "colo:me", "socks5://bob:pw@1.2.3.4:1080", "http://h.example:3128"]) {
+  for (const spec of ["direct", "colo:weur", "colo:me", "socks5://bob:pw@1.2.3.4:1080", "http://h.example:3128", "relay:1.2.3.4:443"]) {
     const entry = parseEgressSpec(spec);
     assert.ok(entry, `should parse ${spec}`);
     const round = parseEgressSpec(entryToSpec(entry));
@@ -51,6 +51,19 @@ test("parseEgressSpec recognises the three kinds and rejects junk", () => {
   assert.equal(parseEgressSpec(""), null);
   assert.equal(parseEgressSpec("socks5://noport"), null);
   assert.equal(parseEgressSpec("ftp://1.2.3.4:21"), null);
+});
+
+test("parseEgressSpec recognises a blind relay (edgetunnel PROXYIP style)", () => {
+  for (const spec of ["relay:1.2.3.4:443", "relay://1.2.3.4:443"]) {
+    const e = parseEgressSpec(spec);
+    assert.equal(e.kind, "relay");
+    assert.equal(e.relay.host, "1.2.3.4");
+    assert.equal(e.relay.port, 443);
+    assert.match(e.id, /^relay:[0-9a-f]{12}$/);
+  }
+  // 同一中继必须得到同一个 id
+  assert.equal(parseEgressSpec("relay:1.2.3.4:443").id, parseEgressSpec("relay://1.2.3.4:443").id);
+  assert.equal(parseEgressSpec("relay:noport"), null);
 });
 
 test("maskProxySpec hides the password", () => {

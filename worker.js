@@ -756,6 +756,28 @@ async function proxyHttpFetch(cfg, entry, url, opts) {
   }
 }
 
+/**
+ * 经「盲转发中继」发一次请求(edgetunnel 的 PROXYIP 就是这类)。
+ * 中继按 SNI 决定往哪转,所以不需要 CONNECT/SOCKS 握手:
+ * 连上中继 → 直接 startTls 到目标域名(SNI 就是目标)→ 说 HTTPS。
+ */
+async function relayHttpFetch(cfg, entry, url, opts) {
+  const connect = await resolveConnect();
+  if (!connect) throw new Error("relay egress requires cloudflare:sockets");
+  const r = entry.relay || {};
+  if (!r.host || !r.port) throw new Error("relay egress: bad spec");
+  const u = new URL(url);
+  const secure = u.protocol !== "http:";
+  const socket = connect({ hostname: r.host, port: r.port }, { secureTransport: "starttls", allowHalfOpen: false });
+  try {
+    const finalSocket = secure ? socket.startTls({ expectedServerHostname: u.hostname }) : socket;
+    return await httpOverSocket(finalSocket, url, opts);
+  } catch (e) {
+    try { socket.close(); } catch (_) {}
+    throw e;
+  }
+}
+
 // ─── 出口池 ─────────────────────────────────────────────────────────────────
 // 出口有三种,统一成同一套「打分 + 排序 + 择优」:
 //   direct        直接用 Worker 自带出口
@@ -789,6 +811,20 @@ function parseEgressSpec(spec) {
       proxy: { scheme, host, port, user, pass },
     };
   }
+  // relay:host:port —— 盲转发中继(edgetunnel 的 PROXYIP 就是这种):连上之后
+  // 它按 SNI 把流量原样转给目标,不需要 CONNECT/SOCKS 握手。
+  const r = /^(?:relay:\/\/|relay:)([^:/@\s]+):(\d+)$/i.exec(s);
+  if (r) {
+    const host = r[1];
+    const port = Number(r[2]);
+    return {
+      id: "relay:" + syncHash(host + ":" + port).slice(0, 12),
+      kind: "relay",
+      target: `${host}:${port}`,
+      label: "relay://" + host + ":" + port,
+      relay: { host, port },
+    };
+  }
   return null;
 }
 /** 默认出口池:沿用 EGRESS_HINT / EGRESS_FALLBACK_HINTS 配的机房。 */
@@ -802,6 +838,7 @@ function entryToSpec(e) {
   if (!e) return "";
   if (e.kind === "direct") return "direct";
   if (e.kind === "colo") return "colo:" + (e.target || "");
+  if (e.kind === "relay") return "relay:" + (e.target || "");
   return e.target || "";
 }
 /** 出口池:优先用 D1 里存的那份(可在前端热改),没有就用配置默认值。 */
@@ -950,6 +987,13 @@ function orderEgress(pool, stats, force) {
   return [pick, ...arr];
 }
 
+/** 从上游响应里取「它认为你的出口在哪」。这是判断机房落点的唯一可靠依据。
+ *  注意:响应是 JSON 套 JSON,引号是转义的(\"),所以先去掉反斜杠再匹配。 */
+function extractEgressLocation(raw) {
+  const flat = String(raw || "").replace(/\\/g, "");
+  const m = /"([^"]{2,40})","SWML_DESCRIPTION_FROM_YOUR_INTERNET_ADDRESS"/.exec(flat);
+  return m ? m[1] : "";
+}
 /** 一次纯净度探测:先文本探针,再(可选)图片探针 —— 图片才是真正卡人的指标。 */
 async function probeEgress(cfg, env, entry, opts) {
   const probeCfg = Object.assign({}, cfg, {
@@ -960,6 +1004,7 @@ async function probeEgress(cfg, env, entry, opts) {
   let textStatus = "error";
   let latency = 0;
   let detail = "";
+  let location = "";
   try {
     const body = buildPayload("Reply with exactly one word: PONG", m.modeId, m.thinkMode, null, m.extra, probeCfg);
     const headers = await buildHeaders(probeCfg);
@@ -967,6 +1012,8 @@ async function probeEgress(cfg, env, entry, opts) {
     const resp = await httpFetch(getUrl(probeCfg), { method: "POST", headers, body, timeoutMs: 60000, socket: true, cfg: probeCfg });
     const raw = await resp.text();
     latency = Date.now() - t0;
+    // 上游会回报它认定的出口位置,这是判断「这个机房到底落在哪」的唯一可靠依据。
+    location = extractEgressLocation(raw);
     const bard = /BardErrorInfo[^0-9]{0,20}(\d{3,5})/.exec(raw);
     if (bard) textStatus = bard[1];
     else if (resp.status === 429 || /recaptcha|unusual traffic/i.test(raw)) textStatus = "429";
@@ -984,6 +1031,8 @@ async function probeEgress(cfg, env, entry, opts) {
       const iheaders = await buildHeaders(probeCfg);
       const iresp = await httpFetch(getUrl(probeCfg), { method: "POST", headers: iheaders, body: ibody, timeoutMs: 90000, socket: true, cfg: probeCfg });
       const iraw = await iresp.text();
+      // 位置块通常只出现在「带内容」的响应里,极简回答没有 —— 从图片探针再取一次
+      if (!location) location = extractEgressLocation(iraw);
       if (/BardErrorInfo[^0-9]{0,20}(\d{3,5})/.test(iraw) || !iresp.ok) imageStatus = "error";
       else if (IMAGE_REGION_RE.test(iraw)) imageStatus = "blocked";
       else {
@@ -1004,7 +1053,7 @@ async function probeEgress(cfg, env, entry, opts) {
     text_status: textStatus,
     image_status: imageStatus,
     latency_ms: latency,
-    detail,
+    detail: [location ? "loc=" + location : "", detail].filter(Boolean).join(" "),
     runs: Number(prev.runs || 0) + 1,
     ok_runs: Number(prev.ok_runs || 0) + (textStatus === "ok" ? 1 : 0),
     image_ok_runs: Number(prev.image_ok_runs || 0) + (imageStatus === "ok" ? 1 : 0),
@@ -1061,6 +1110,9 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
     const e = cfg._egress;
     if (e.kind === "proxy") {
       return await proxyHttpFetch(cfg, e, url, { method, headers, body, timeoutMs });
+    }
+    if (e.kind === "relay") {
+      return await relayHttpFetch(cfg, e, url, { method, headers, body, timeoutMs });
     }
     if (e.kind === "colo" && cfg._env && cfg._env.EGRESS) {
       const relayed = await doEgressFetch(cfg, url, { method, headers, body, redirect }, [e.target]);
@@ -3888,6 +3940,13 @@ async function handleRawDebug(req, cfg) {
   const modelName = String(req.model || cfg.default_model);
   const m = resolveModel(modelName, cfg.default_model);
   if (m.error) return jsonResponse({ error: m.error }, 400);
+  // 强制走指定出口(排查某个机房/代理到底返回什么时用)
+  let dcfg = cfg;
+  if (req.egress) {
+    const e = parseEgressSpec(String(req.egress));
+    if (!e) return jsonResponse({ error: { message: "bad egress spec" } }, 400);
+    dcfg = Object.assign({}, cfg, { _egress: e, _forceEgress: true, do_egress: false, fingerprint_jitter_ms: 0 });
+  }
   // 传了 inner 就原样下发(只换掉每次请求都该变的 [59] 请求 uuid)。
   // 用来把「真实网页客户端发的 payload」搬过来逐槽位复现上游行为。
   let body;
@@ -3896,13 +3955,13 @@ async function handleRawDebug(req, cfg) {
     inner[59] = uuid();
     const outer = [null, JSON.stringify(inner)];
     const form = { "f.req": JSON.stringify(outer) };
-    if (cfg.xsrf_token) form.at = cfg.xsrf_token;
+    if (dcfg.xsrf_token) form.at = dcfg.xsrf_token;
     body = new URLSearchParams(form).toString();
   } else {
-    body = buildPayload(prompt, m.modeId, m.thinkMode, null, m.extra, cfg);
+    body = buildPayload(prompt, m.modeId, m.thinkMode, null, m.extra, dcfg);
   }
-  const headers = await buildHeaders(cfg);
-  const r = await httpFetch(getUrl(cfg), { method: "POST", headers, body, timeoutMs: Number(req.timeout_ms) || 120000, socket: cfg.upstream_socket, cfg });
+  const headers = await buildHeaders(dcfg);
+  const r = await httpFetch(getUrl(dcfg), { method: "POST", headers, body, timeoutMs: Number(req.timeout_ms) || 120000, socket: dcfg.upstream_socket, cfg: dcfg });
   const raw = await r.text();
   const limit = Math.min(Number(req.limit) || 400000, 2000000);
   const sc = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];

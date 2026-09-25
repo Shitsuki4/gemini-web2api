@@ -164,7 +164,8 @@ export const UI_HTML = `<!doctype html>
       <h2>出口池配置</h2>
       <div class="hint" style="margin-bottom:8px">每行一条。支持 <span class="mono">direct</span>、
         <span class="mono">colo:weur</span>(Cloudflare 机房)、
-        <span class="mono">socks5://user:pass@host:1080</span> 或 <span class="mono">http://host:3128</span>(外部代理)。</div>
+        <span class="mono">socks5://user:pass@host:1080</span> 或 <span class="mono">http://host:3128</span>(外部代理)、
+        <span class="mono">relay:host:443</span>(盲转发中继,edgetunnel 的 PROXYIP 就是这种 —— 连上后它按 SNI 直接转给目标)。</div>
       <textarea id="poolText" class="mono" style="width:100%;min-height:130px"></textarea>
       <div class="row" style="margin-top:8px">
         <button class="primary" id="savePool">保存出口池</button>
