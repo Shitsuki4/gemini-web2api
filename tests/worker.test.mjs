@@ -13,6 +13,7 @@ import {
   isPrivateHostname,
   parseToolCalls,
   cleanText,
+  getConfig,
 } from "../worker.js";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -149,4 +150,21 @@ test("normalizeMimeType maps image/jpg to image/jpeg", () => {
   assert.equal(normalizeMimeType("image/jpg"), "image/jpeg");
   assert.equal(normalizeMimeType("IMAGE/JPEG; charset=x"), "image/jpeg");
   assert.equal(normalizeMimeType("", "image/png"), "image/png");
+});
+
+test("getConfig keeps a single cookie containing | intact", () => {
+  // 回归:Google 的 LSID 里带 `|`(LSID=s.GB|s.youtube:…)。按 `|` 切会把 cookie
+  // 从中间截断(实测只剩 183 字符),表现为「鉴权莫名其妙失效」。
+  // 只有 GEMINI_COOKIES(多账号池)才该按 `|` 分隔。
+  const one = "SID=abc; LSID=s.GB|s.youtube:g.a000CwnTTRUIzry; HSID=xyz";
+  const cfg1 = getConfig({ GEMINI_COOKIE: one });
+  assert.equal(cfg1.cookie, one, "single cookie must survive verbatim");
+  assert.equal(cfg1.cookie_pool.length, 1);
+
+  const viaCookieString = getConfig({ COOKIE_STRING: one });
+  assert.equal(viaCookieString.cookie, one);
+
+  // 多账号池仍然按 `|` 切
+  const cfg2 = getConfig({ GEMINI_COOKIES: "SID=a1; HSID=h1|SID=a2; HSID=h2" });
+  assert.equal(cfg2.cookie_pool.length, 2);
 });

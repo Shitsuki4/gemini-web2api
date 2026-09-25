@@ -239,8 +239,19 @@ function parseCookieEntry(entry) {
 }
 function getConfig(env) {
   env = env || {};
-  const cookieRaw = env.GEMINI_COOKIES || env.COOKIE_STRING || env.GEMINI_COOKIE || CONFIG.GEMINI_COOKIES || CONFIG.GEMINI_COOKIE || "";
-  const cookieEntries = splitEnvList(cookieRaw).map(parseCookieEntry).filter((x) => x.cookie);
+  // 多账号池用 `|` 分隔;但**单个 cookie 里也可能含 `|`**(Google 的
+  // LSID=s.GB|s.youtube:… 就是),拿它当分隔符会把 cookie 从中间切断 —— 表现为
+  // 鉴权莫名其妙失效(cookie 只剩一百多字符)。所以只有 GEMINI_COOKIES 按 `|` 切,
+  // 其余按行切(cookie 不可能含换行)。
+  let cookieRaw = "";
+  let multi = false;
+  if (env.GEMINI_COOKIES) { cookieRaw = env.GEMINI_COOKIES; multi = true; }
+  else if (env.GEMINI_COOKIE) cookieRaw = env.GEMINI_COOKIE;
+  else if (env.COOKIE_STRING) cookieRaw = env.COOKIE_STRING;
+  else if (CONFIG.GEMINI_COOKIES) { cookieRaw = CONFIG.GEMINI_COOKIES; multi = true; }
+  else if (CONFIG.GEMINI_COOKIE) cookieRaw = CONFIG.GEMINI_COOKIE;
+  const cookieEntries = (multi ? splitEnvList(cookieRaw) : String(cookieRaw).split(/\r?\n/).map((x) => x.trim()).filter(Boolean))
+    .map(parseCookieEntry).filter((x) => x.cookie);
   const cookieIndex = cookieEntries.length ? Math.floor(Math.random() * cookieEntries.length) : 0;
   let cookie = (cookieEntries[cookieIndex] && cookieEntries[cookieIndex].cookie) || "";
   let sapisid = (cookieEntries[cookieIndex] && cookieEntries[cookieIndex].sapisid) || "";
