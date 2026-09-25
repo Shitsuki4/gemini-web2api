@@ -150,6 +150,11 @@ const CONFIG = {
   EGRESS_FORCE: "",
   // 纯净度探测是否顺带测「图片生成能不能出图」(图片才是真正卡人的指标,但会真的调一次生成)
   EGRESS_PROBE_IMAGE: true,
+  // ── SSE 心跳 ────────────────────────────────────────────────────────────
+  // 生成期间定期发 SSE 注释行,避免客户端(尤其 Android OkHttp,默认读超时 10s)
+  // 在静默期判定连接已死、报 "unexpected end of stream"。0 = 关闭。
+  // 默认 5s:必须明显小于常见的 10s 读超时,否则就是和超时赛跑。
+  SSE_HEARTBEAT_MS: 5000,
 };
 // ─── 模型 ────────────────────────────────────────────────────────────────
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
@@ -306,6 +311,7 @@ function getConfig(env) {
     egress_pool: String(envOr(env, "EGRESS_POOL", CONFIG.EGRESS_POOL) || ""),
     egress_force: String(envOr(env, "EGRESS_FORCE", CONFIG.EGRESS_FORCE) || "").trim(),
     egress_probe_image: parseBool(envOr(env, "EGRESS_PROBE_IMAGE", CONFIG.EGRESS_PROBE_IMAGE), true),
+    sse_heartbeat_ms: Math.max(0, parseIntDefault(envOr(env, "SSE_HEARTBEAT_MS", CONFIG.SSE_HEARTBEAT_MS), 5000)),
     _env: env,
     _ctx: null,
     _cookieSource: cookieEntries.length > 1 ? "env-pool" : (env.GEMINI_COOKIE || env.GEMINI_COOKIES || env.COOKIE_STRING ? "env" : (CONFIG.GEMINI_COOKIE ? "builtin" : "none")),
@@ -2229,12 +2235,22 @@ function authorized(request, url, cfg) {
 /**
  * 构造一个 SSE 响应,响应体由 `producer(write)` 生成。
  * `write(str)` 会入队一个 UTF-8 分块。producer 结束后流会自动关闭。
+ *
+ * heartbeatMs > 0 时,生成期间会定期发一个 SSE 注释行(`: ping`)。长回答动辄
+ * 几十秒,而不少客户端(典型是 Android 内置 OkHttp,默认读超时 10s)会在静默期
+ * 判定连接已死,报 "unexpected end of stream"。心跳能让它们持续拿到数据、
+ * 不断重置读超时;注释行以 `:` 开头,按 SSE 规范会被客户端忽略。
  */
-function sseResponse(producer, extra) {
+function sseResponse(producer, extra, heartbeatMs) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
-      const write = (s) => controller.enqueue(encoder.encode(s));
+      let hb = null;
+      let closed = false;
+      const write = (s) => { if (!closed) controller.enqueue(encoder.encode(s)); };
+      if (heartbeatMs > 0) {
+        hb = setInterval(() => { try { write(": ping\n"); } catch (_) {} }, heartbeatMs);
+      }
       try {
         await producer(write);
       } catch (e) {
@@ -2245,6 +2261,8 @@ function sseResponse(producer, extra) {
           write("data: [DONE]\n\n");
         } catch (_) { /* ignore */ }
       } finally {
+        if (hb) { clearInterval(hb); hb = null; }
+        closed = true;
         try { controller.close(); } catch (_) {}
       }
     },
@@ -2351,7 +2369,7 @@ async function handleChat(req, cfg, request) {
         if (cidOut) write(": gemini-cid=" + cidOut + "\n\n");
         write("data: [DONE]\n\n");
       }
-    }, turnHeaders);
+    }, turnHeaders, cfg.sse_heartbeat_ms);
   }
   let text;
   try {
@@ -2384,7 +2402,7 @@ async function handleChat(req, cfg, request) {
         choices: [{ index: 0, delta: msg, finish_reason: finish }],
       })}\n\n`);
       write("data: [DONE]\n\n");
-    }, turnHeaders);
+    }, turnHeaders, cfg.sse_heartbeat_ms);
   }
   return jsonResponse({
     id: cid, object: "chat.completion", created: nowSec(), model: rm.name,
@@ -2576,7 +2594,7 @@ async function handleResponses(req, cfg, request) {
         }
       });
       emit("response.completed", { response: { ...baseResponse, status: "completed", output, usage } });
-    }, { ...turnHeaders, ...cidHeaders() });
+    }, { ...turnHeaders, ...cidHeaders() }, cfg.sse_heartbeat_ms);
   }
   return jsonResponse({ id: rid, object: "response", created_at: nowSec(), status: "completed", model: rm.name, output, usage }, 200, { ...turnHeaders, ...cidHeaders() });
 }
@@ -2608,7 +2626,7 @@ async function handleGoogleGenerate(req, cfg, path, stream, request) {
           modelVersion: rm.name,
         })}\n\n`);
       }
-    });
+    }, null, cfg.sse_heartbeat_ms);
   }
   let text;
   try {
@@ -2635,7 +2653,7 @@ async function handleGoogleGenerate(req, cfg, path, stream, request) {
     modelVersion: rm.name,
   };
   if (stream) {
-    return sseResponse(async (write) => { write(`data: ${JSON.stringify(responseObj)}\n\n`); });
+    return sseResponse(async (write) => { write(`data: ${JSON.stringify(responseObj)}\n\n`); }, null, cfg.sse_heartbeat_ms);
   }
   return jsonResponse(responseObj);
 }
@@ -4102,6 +4120,7 @@ export {
   fileRefCacheKey, pickFingerprint, handleRawDebug,
   syncHash, extractSessionMeta, sessionKey, planTurn, messageHash, renderSlice, renderMessageParts,
   memoryBlock, memoryList, memoryAdd, memoryScope, imageProxyUrl, imgKeyOf, handleImageProxy,
+  sseResponse, extractEgressLocation,
   parseEgressSpec, entryToSpec, defaultEgressPool, scoreEgress, orderEgress, maskProxySpec, socks5Connect, streamSource,
   httpOverSocket, proxyHttpFetch, applyEgressAttempt,
 };
