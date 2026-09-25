@@ -54,7 +54,18 @@ proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 ht
 
 **代理隧道的实现**:`cloudflare:sockets` 的 `connect()` 建 TCP → HTTP 代理发 `CONNECT`(带 `Proxy-Authorization: Basic`)/ SOCKS5 做握手(支持用户名密码与域名 ATYP)→ `socket.startTls()` 到目标域名 → 复用同一套 HTTP/1.1 收发逻辑。隧道建成前不发送任何业务数据,所以 Gemini 的 cookie 不会明文暴露给代理。
 
-> **实测结论(2026-09-25,本部署)**:把 `wnam/enam/sam/weur/eeur/apac/me` 七个 Cloudflare 机房逐个测过 —— 文本全部正常(1.9–2.7s),但**图片生成全部被拒**;`oc`/`afr` 直接 302。也就是说**换 Cloudflare 机房解决不了图片生成**,要拿到能出图的出口得接真正的外部代理 IP。这正是出口池支持 `proxy:` 的原因。
+> **实测结论(2026-09-25,本部署)**:图片生成的开关是**出口 IP**,不是账号、不是 payload。
+>
+> 证据链(用 Roxy 浏览器的 CDP 抓的真实请求):
+> 1. 同一个浏览器、同一个账号,在 Gemini 网页上**能正常出图**(响应里拿到 `gg-dl` 图片链接);该请求经用户代理出口,位置显示为**台湾彰化**。
+> 2. 把这个浏览器请求的 payload **原样搬到本 Worker 重放**,照样被拒 —— 说明差异不在 payload。
+> 3. 逐项比对 cookie:`SID/HSID/SSID/APISID/SAPISID/__Secure-1PSID/__Secure-3PSID` **全部相同** —— 同一个账号、同一套登录态。
+> 4. 同一个请求经 Cloudflare 出口时,位置显示 **Netherlands**,被拒。
+> 5. 七个可用 Cloudflare 机房(`wnam/enam/sam/weur/eeur/apac/me`)逐个测:文本全正常,图片**全被拒**;`oc`/`afr` 直接 302。
+>
+> 所以:**换 Cloudflare 机房解决不了图片生成**,要出图得接一个 IP 干净的**外部代理** —— 这正是出口池支持 `proxy:` 的原因。把可用的代理加进池里跑一次测试,`/admin/egress` 会直接告诉你哪个能出图。
+>
+> 另外两个与机制相关的实测:`socket.startTls()` 必须以 `secureTransport: "starttls"` 建连(否则报 "must be set to 'starttls'");`https://` 代理不支持 —— Workers 的 socket 不能在已加密的连接上再 `startTls`,无法做双层 TLS。
 
 ## HTTP 端点
 
@@ -77,6 +88,8 @@ proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 ht
 | `POST /admin/egress` | `{"action":"test"\|"pool"\|"force"\|"probe_image", ...}` |
 | `GET /admin/sessions` | 会话列表(`?limit=`) |
 | `POST /admin/sessions` | `{"sid":"..."}` 删一个,`{"all":true}` 清空 |
+| `POST /v1/debug/raw` | 回显上游原始响应;传 `{"inner":[...]}` 可原样下发给定 payload(逐槽位对比网页客户端行为) |
+| `POST /v1/debug/egress` | 出口连通性诊断:`{"egress":"proxy:...","url":"https://..."}`(目标域名白名单限制,避免变成任意 URL 抓取) |
 | `GET /debug` | 从部署环境实地探测上游(状态/片段/BL) |
 
 ## 快速开始

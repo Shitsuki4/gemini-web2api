@@ -704,9 +704,15 @@ async function proxyHttpFetch(cfg, entry, url, opts) {
   const u = new URL(url);
   const secure = u.protocol !== "http:";
   const targetPort = u.port ? Number(u.port) : (secure ? 443 : 80);
+  // 必须先以 starttls 打开,否则 socket.startTls() 会直接报
+  // "secureTransport must be set to 'starttls'"。
+  // 注意:https:// 代理这里也按明文连接处理(Workers 的 socket 不支持在已加密的
+  // 连接上再 startTls,即无法做双层 TLS);隧道内的业务数据仍然是端到端 TLS,
+  // 只有 CONNECT 行与代理凭据会以明文经过这一跳。
+  if (p.scheme === "https") log(cfg, `代理 ${p.host}:${p.port} 用 https:// 声明,按明文 HTTP 代理处理(不支持双层 TLS)`);
   const socket = connect(
     { hostname: p.host, port: p.port },
-    { secureTransport: p.scheme === "https" ? "on" : "off", allowHalfOpen: false }
+    { secureTransport: "starttls", allowHalfOpen: false }
   );
   let writer = null;
   let reader = null;
@@ -807,8 +813,27 @@ async function loadEgressPool(cfg, env) {
 }
 async function saveEgressPool(env, specs) {
   if (!env || !env.DB) return false;
+  let prev = [];
+  try {
+    await ensureSchema(env);
+    const r = await env.DB.prepare("SELECT target FROM egress_pool").all();
+    prev = ((r && r.results) || []).map((x) => x.target).filter(Boolean);
+  } catch (_) { /* 读不到就当没有 */ }
   const parsed = (specs || [])
-    .map((s) => parseEgressSpec(typeof s === "string" ? s : (s && s.target) || ""))
+    .map((s) => {
+      const spec = typeof s === "string" ? s : (s && s.target) || "";
+      let e = parseEgressSpec(spec);
+      // GET 接口回显时密码是 ***。前端把打码后的池原样存回来的话,得把真密码找回来,
+      // 否则「在页面上点一次保存」就把代理凭据抹成 *** 了。
+      if (e && e.kind === "proxy" && e.proxy.pass === "***") {
+        const match = prev
+          .map((t) => parseEgressSpec(t))
+          .find((p) => p && p.kind === "proxy" && p.proxy.scheme === e.proxy.scheme &&
+            p.proxy.host === e.proxy.host && p.proxy.port === e.proxy.port && p.proxy.user === e.proxy.user);
+        if (match) e = match;
+      }
+      return e;
+    })
     .filter(Boolean);
   try {
     await ensureSchema(env);
@@ -1024,8 +1049,9 @@ function applyEgressAttempt(cfg, attempt) {
 // (不同 TCP 连接常落到不同出口),降低被 Google 单点风控(1060)的概率。
 async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true, redirect, cfg } = {}) {
   const gemini = isGeminiOrigin(url, cfg);
-  // ① 显式指定的出口优先(出口池调度、纯净度探测都从这条路走)
-  if (cfg && cfg._egress && gemini) {
+  // ① 显式指定的出口优先(出口池调度、纯净度探测都从这条路走)。
+  //    正常情况下只作用于 Gemini 源站;诊断用 _forceEgress 绕过该限制。
+  if (cfg && cfg._egress && (gemini || cfg._forceEgress)) {
     const e = cfg._egress;
     if (e.kind === "proxy") {
       return await proxyHttpFetch(cfg, e, url, { method, headers, body, timeoutMs });
@@ -3462,6 +3488,10 @@ export default {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await handleRawDebug(req, cfg);
         }
+        if (path === "/v1/debug/egress") {
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleEgressDiag(req, cfg);
+        }
         if (path === "/v1/memories") {
           return await handleMemories(request, cfg, env, url, "POST", req);
         }
@@ -3796,7 +3826,19 @@ async function handleRawDebug(req, cfg) {
   const modelName = String(req.model || cfg.default_model);
   const m = resolveModel(modelName, cfg.default_model);
   if (m.error) return jsonResponse({ error: m.error }, 400);
-  const body = buildPayload(prompt, m.modeId, m.thinkMode, null, m.extra, cfg);
+  // 传了 inner 就原样下发(只换掉每次请求都该变的 [59] 请求 uuid)。
+  // 用来把「真实网页客户端发的 payload」搬过来逐槽位复现上游行为。
+  let body;
+  if (Array.isArray(req.inner)) {
+    const inner = req.inner.slice();
+    inner[59] = uuid();
+    const outer = [null, JSON.stringify(inner)];
+    const form = { "f.req": JSON.stringify(outer) };
+    if (cfg.xsrf_token) form.at = cfg.xsrf_token;
+    body = new URLSearchParams(form).toString();
+  } else {
+    body = buildPayload(prompt, m.modeId, m.thinkMode, null, m.extra, cfg);
+  }
   const headers = await buildHeaders(cfg);
   const r = await httpFetch(getUrl(cfg), { method: "POST", headers, body, timeoutMs: Number(req.timeout_ms) || 120000, socket: cfg.upstream_socket, cfg });
   const raw = await r.text();
@@ -3811,6 +3853,45 @@ async function handleRawDebug(req, cfg) {
     contentType: r.headers.get("content-type"),
     raw: raw.slice(0, limit),
   });
+}
+// 出口连通性诊断:用指定出口去取一个白名单里的网址,看隧道到底通不通。
+// 目标域名做了白名单限制 —— 否则它就是一个带鉴权的任意 URL 抓取(SSRF)入口。
+const EGRESS_DIAG_HOSTS = new Set(["gemini.google.com", "www.google.com", "api.ipify.org", "ipinfo.io", "www.cloudflare.com"]);
+async function handleEgressDiag(req, cfg) {
+  // 隔离测试:不经代理,直接以 secureTransport:"starttls" 连 443 再升级。
+  // 用来把「我们的 startTls 用法不对」和「代理不支持隧道」区分开。
+  if (String(req.egress || "") === "raw-starttls") {
+    const host = "gemini.google.com";
+    const connect = await resolveConnect();
+    if (!connect) return jsonResponse({ ok: false, error: "cloudflare:sockets unavailable" }, 502);
+    const t0 = Date.now();
+    try {
+      const s = connect({ hostname: host, port: 443 }, { secureTransport: "starttls", allowHalfOpen: false });
+      const t = s.startTls({ expectedServerHostname: host });
+      const r = await httpOverSocket(t, "https://" + host + "/", { method: "GET", headers: { "User-Agent": _UA }, timeoutMs: 25000 });
+      const text = (await r.text()).slice(0, 200);
+      return jsonResponse({ ok: true, mode: "raw-starttls", status: r.status, ms: Date.now() - t0, body: text });
+    } catch (e) {
+      return jsonResponse({ ok: false, mode: "raw-starttls", ms: Date.now() - t0, error: String((e && e.message) || e) }, 502);
+    }
+  }
+  const entry = parseEgressSpec(String(req.egress || "").trim());
+  if (!entry) return jsonResponse({ error: { message: "bad egress spec" } }, 400);
+  let u;
+  try { u = new URL(String(req.url || "https://api.ipify.org?format=json")); }
+  catch (_) { return jsonResponse({ error: { message: "bad url" } }, 400); }
+  if (u.protocol !== "https:" || !EGRESS_DIAG_HOSTS.has(u.hostname)) {
+    return jsonResponse({ error: { message: "url must be https:// and one of: " + [...EGRESS_DIAG_HOSTS].join(", ") } }, 400);
+  }
+  const c = Object.assign({}, cfg, { _egress: entry, _forceEgress: true, do_egress: false, fingerprint_jitter_ms: 0, retry_attempts: 1, log_requests: false });
+  const t0 = Date.now();
+  try {
+    const r = await httpFetch(u.toString(), { method: "GET", headers: { "User-Agent": _UA }, timeoutMs: 30000, socket: true, cfg: c });
+    const text = (await r.text()).slice(0, 600);
+    return jsonResponse({ ok: true, egress: entry.label, url: u.toString(), status: r.status, ms: Date.now() - t0, body: text });
+  } catch (e) {
+    return jsonResponse({ ok: false, egress: entry.label, url: u.toString(), ms: Date.now() - t0, error: String((e && e.message) || e) }, 502);
+  }
 }
 // 导出给本地测试用(Workers 运行时会忽略)。
 export {
