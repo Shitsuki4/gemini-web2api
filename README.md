@@ -135,6 +135,7 @@
 - **上游风控**:Google 会按出口 IP 拒绝部分数据中心流量(`BardErrorInfo[1060]`)。在 Cloudflare 部署若遇此问题,把 `GEMINI_ORIGIN` 指向一个住宅/干净 IP 的反向代理,或依赖 `DO_EGRESS` 出口池换机房。
 - **图片生成受账号/出口限制**:上游可能直接回「Are you signed in? ... image creation isn't available in your location yet.」。这是 Gemini 侧对账号资格或出口 IP 的判断,与本仓库无关 —— 换更干净的出口 IP 或确认账号有图片生成资格。中转链路(`/img/<key>`)只负责转发与缓存,不解决这一点。
 - **会话绑在 Gemini 侧**:续聊依赖上游返回的 `cid`/`rid` 仍然有效;上游会话被清理或 cookie 换号后会退回新会话(不会报错)。
+- **隐式会话键可能撞车**:不显式给会话 id 时,键 = `API key + 首条用户消息`。若同时开着**两个第一句完全相同**的对话并交叉发消息,理论上会互相串上下文。多会话客户端请显式带 `X-Session-Id`(或 body 的 `session_id`)——单条消息的新请求永远不会误续,所以只影响"同开头 + 并发"这一种情况。
 - **`/img` 是公开端点**:靠不可猜的 key 当凭据(`<img>` 标签发不出 Authorization 头)。key 只由白名单内的 `googleusercontent.com` URL 生成,不构成任意 URL 代理;另有每 IP 限流。
 - **图片缓存 7 天后失效**:R2 生命周期到期删除后,若上游签名链也已过期,该图将无法再取回。
 - **图片需登录态**:未配置 `GEMINI_COOKIE` 时图片会被忽略并在 prompt 中提示。
