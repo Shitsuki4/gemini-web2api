@@ -69,6 +69,14 @@ proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 ht
 > 所以:**换 Cloudflare 机房解决不了图片生成**,要出图得接一个 IP 干净的**外部代理** —— 这正是出口池支持 `proxy:` 的原因。把可用的代理加进池里跑一次测试,`/admin/egress` 会直接告诉你哪个能出图。
 >
 > 另外两个与机制相关的实测:`socket.startTls()` 必须以 `secureTransport: "starttls"` 建连(否则报 "must be set to 'starttls'");`https://` 代理不支持 —— Workers 的 socket 不能在已加密的连接上再 `startTls`,无法做双层 TLS。
+>
+> 代理隧道这一路已逐层验证过,结论是「缺一个能用的代理」,不是代码问题:
+> - `POST /v1/debug/egress` 传 `{"egress":"proxy:…","url":"http://api.ipify.org/"}`:纯 HTTP 穿过隧道**成功**,并且返回的正是代理自己的 IP → 隧道转发正常、出口确实换掉了。
+> - 同一隧道走 `https://` → `TLS Handshake Failed`。
+> - `{"egress":"raw-starttls"}`(不经代理、直接 starttls 连 443)→ **成功**。
+> - `{"egress":"smtp-starttls"}`(SMTP 的 STARTTLS 流程,天生是「先明文收发、再升级」)→ **成功升级**,证明运行时支持在明文 I/O 之后 `startTls`。
+>
+> 即:代码路径没问题,是**那两个代理在 CONNECT 隧道里不承载 TLS**(典型是做了 TLS 拦截)。换一个不做 MITM 的 SOCKS5/HTTP 代理即可,加进池里跑一次测试直接看结果。
 
 ## HTTP 端点
 
@@ -92,7 +100,7 @@ proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 ht
 | `GET /admin/sessions` | 会话列表(`?limit=`) |
 | `POST /admin/sessions` | `{"sid":"..."}` 删一个,`{"all":true}` 清空 |
 | `POST /v1/debug/raw` | 回显上游原始响应;传 `{"inner":[...]}` 可原样下发给定 payload(逐槽位对比网页客户端行为) |
-| `POST /v1/debug/egress` | 出口连通性诊断:`{"egress":"proxy:...","url":"https://..."}`(目标域名白名单限制,避免变成任意 URL 抓取) |
+| `POST /v1/debug/egress` | 出口连通性诊断:`{"egress":"proxy:...","url":"https://..."}`(目标域名白名单限制,避免变成任意 URL 抓取);`egress` 传 `"raw-starttls"` 或 `"smtp-starttls"` 可验证运行时本身能否做 TLS 升级 |
 | `GET /debug` | 从部署环境实地探测上游(状态/片段/BL) |
 
 ## 快速开始
