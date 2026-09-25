@@ -3,3 +3,5 @@
 node_modules/
 
 tail.log
+
+wrangler.staging.toml

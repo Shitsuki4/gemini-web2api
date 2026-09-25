@@ -13,6 +13,18 @@ binding = "DB"
 database_name = "gemini-router-db"
 database_id = "ebaf9b4e-9ec1-4a52-a37a-3905f8267c50"
 
+# 生成的图片字节。桶上挂了 7 天生命周期规则(img/ 前缀自动删除),
+# worker 侧另有月度写入预算(IMAGE_R2_MONTHLY_MAX_BYTES),不会超出免费额度。
+[[r2_buckets]]
+binding = "FILECACHE"
+bucket_name = "gemini-web2api-images"
+
+[vars]
+# 对外真正可达的源。生产入口是 gemini-proxy 中转 worker,所以不能从
+# request.url 推导(推出来是 workers.dev,用户访问不到)。
+# 生成的图片链接会改写成 <PUBLIC_ORIGIN>/img/<key>。
+PUBLIC_ORIGIN = "https://api.shigatsuki.eu.org"
+
 # 每 6 小时:抓一次 Gemini 首页,把滚动更新的 __Secure-1PSIDTS/SNlM0e/bl 写回 KV
 [triggers]
 crons = ["7 */6 * * *"]

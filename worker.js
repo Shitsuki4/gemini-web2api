@@ -38,7 +38,7 @@
  * 1100 拒绝),并在 prompt 里加一句提示。`gemini-3.1-pro` 也只有带付费账号 cookie
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
-const VERSION = "1.5.0-worker";
+const VERSION = "2.0.0-worker";
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
 //  若设置了同名的 Worker 环境变量 / secret,会覆盖这里的值;不设则用此处的值。
@@ -106,6 +106,36 @@ const CONFIG = {
   RATE_LIMIT_ENABLED: true,
   RATE_LIMIT_MAX: 3000,
   RATE_LIMIT_WINDOW: 60,
+  // ── 服务端会话(续聊)──────────────────────────────────────────────────
+  // 把历史留在 Gemini 侧:命中会话时上游只收到「新增的那一条」,
+  // 而不是每轮都把整段对话重拼一遍。详见 sessionPlanTurn()。
+  SESSION_MEMORY: true,
+  // 会话映射(cid/rid/rcid)保留多久;超时按新会话处理。
+  SESSION_TTL_SEC: 604800,
+  // 客户端「只发增量、不发历史」时必须显式声明会话(X-Session-Mode: delta)。
+  SESSION_DELTA_DEFAULT: false,
+  // ── 长期记忆(跨会话)──────────────────────────────────────────────────
+  MEMORY_ENABLED: true,
+  // 每轮结束后额外调一次上游提炼事实(会让每轮多一次上游请求),默认关。
+  MEMORY_AUTO_EXTRACT: false,
+  MEMORY_MAX_ITEMS: 200,
+  // 注入到 prompt 里的记忆块字节上限(超了按更新时间截断)。
+  MEMORY_INJECT_MAX_BYTES: 8000,
+  // ── 生成图片:经本 worker 的域名中转 ────────────────────────────────
+  // 上游返回的 googleusercontent 直链会改写成 <PUBLIC_ORIGIN>/img/<key>。
+  IMAGE_PROXY: true,
+  // 对外真正可达的源(必须显式配置:生产入口是 gemini-proxy 中转,
+  // worker 从 request.url 推导出来的是 workers.dev,用户访问不到)。
+  PUBLIC_ORIGIN: "",
+  IMAGE_R2_STORE: true,
+  // R2 月度写入上限(字节)。R2 免费额度 10 GB-月,默认 4 GiB 留足余量;
+  // 超了就不再写 R2,图片仍走边缘缓存/实时回源,功能不受影响。
+  IMAGE_R2_MONTHLY_MAX_BYTES: 4294967296,
+  // 单张超过这个大小不落 R2。
+  IMAGE_OBJECT_MAX_BYTES: 12582912,
+  // 图片缓存时间(秒),与 R2 的 7 天生命周期规则对齐。
+  IMAGE_CACHE_TTL_SEC: 604800,
+  IMAGE_PROXY_RATE_MAX: 600,
 };
 // ─── 模型 ────────────────────────────────────────────────────────────────
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
@@ -234,7 +264,22 @@ function getConfig(env) {
     rate_limit_enabled: parseBool(envOr(env, "RATE_LIMIT_ENABLED", CONFIG.RATE_LIMIT_ENABLED), true),
     rate_limit_max: Math.max(1, parseIntDefault(envOr(env, "RATE_LIMIT_MAX", CONFIG.RATE_LIMIT_MAX), 3000)),
     rate_limit_window: Math.max(1, parseIntDefault(envOr(env, "RATE_LIMIT_WINDOW", CONFIG.RATE_LIMIT_WINDOW), 60)),
+    session_memory: parseBool(envOr(env, "SESSION_MEMORY", CONFIG.SESSION_MEMORY), true),
+    session_ttl_sec: Math.max(60, parseIntDefault(envOr(env, "SESSION_TTL_SEC", CONFIG.SESSION_TTL_SEC), 604800)),
+    session_delta_default: parseBool(envOr(env, "SESSION_DELTA_DEFAULT", CONFIG.SESSION_DELTA_DEFAULT), false),
+    memory_enabled: parseBool(envOr(env, "MEMORY_ENABLED", CONFIG.MEMORY_ENABLED), true),
+    memory_auto_extract: parseBool(envOr(env, "MEMORY_AUTO_EXTRACT", CONFIG.MEMORY_AUTO_EXTRACT), false),
+    memory_max_items: Math.max(1, parseIntDefault(envOr(env, "MEMORY_MAX_ITEMS", CONFIG.MEMORY_MAX_ITEMS), 200)),
+    memory_inject_max_bytes: Math.max(0, parseIntDefault(envOr(env, "MEMORY_INJECT_MAX_BYTES", CONFIG.MEMORY_INJECT_MAX_BYTES), 8000)),
+    image_proxy: parseBool(envOr(env, "IMAGE_PROXY", CONFIG.IMAGE_PROXY), true),
+    public_origin: String(envOr(env, "PUBLIC_ORIGIN", CONFIG.PUBLIC_ORIGIN) || "").replace(/\/+$/, ""),
+    image_r2_store: parseBool(envOr(env, "IMAGE_R2_STORE", CONFIG.IMAGE_R2_STORE), true),
+    image_r2_monthly_max_bytes: Math.max(0, parseIntDefault(envOr(env, "IMAGE_R2_MONTHLY_MAX_BYTES", CONFIG.IMAGE_R2_MONTHLY_MAX_BYTES), 4294967296)),
+    image_object_max_bytes: Math.max(1024, parseIntDefault(envOr(env, "IMAGE_OBJECT_MAX_BYTES", CONFIG.IMAGE_OBJECT_MAX_BYTES), 12582912)),
+    image_cache_ttl_sec: Math.max(60, parseIntDefault(envOr(env, "IMAGE_CACHE_TTL_SEC", CONFIG.IMAGE_CACHE_TTL_SEC), 604800)),
+    image_proxy_rate_max: Math.max(1, parseIntDefault(envOr(env, "IMAGE_PROXY_RATE_MAX", CONFIG.IMAGE_PROXY_RATE_MAX), 600)),
     _env: env,
+    _ctx: null,
     _cookieSource: cookieEntries.length > 1 ? "env-pool" : (env.GEMINI_COOKIE || env.GEMINI_COOKIES || env.COOKIE_STRING ? "env" : (CONFIG.GEMINI_COOKIE ? "builtin" : "none")),
     _cookieIndex: cookieIndex,
     cookie_pool: cookieEntries.map((x) => x.cookie),
@@ -322,7 +367,17 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra, cfg) {
     inner[0] = [prompt, 0, null, null, null, null, 0];
   }
   inner[1] = ["en"];
-  inner[2] = ["", "", "", null, null, null, null, null, null, ""];
+  // 会话续聊:Gemini 靠 inner[2] 的前三个槽认出「这是同一会话的下一轮」。
+  // 槽位形状由抓包实测确认(imgraw2.txt):
+  //   响应里 inner[1] = ["c_…","r_…"],inner[4][0][0] = "rc_…";
+  //   而新会话时 inner[2] 恰好是三个空串打头,故续聊填 [cid, rid, rcid]。
+  // 带上它 + 只发新增内容,Gemini 侧的历史就不用每轮重传。
+  const smeta = cfg && cfg._session_meta;
+  if (Array.isArray(smeta) && smeta[0] && smeta[1]) {
+    inner[2] = [String(smeta[0]), String(smeta[1]), smeta[2] ? String(smeta[2]) : "", null, null, null, null, null, null, ""];
+  } else {
+    inner[2] = ["", "", "", null, null, null, null, null, null, ""];
+  }
   inner[6] = [0];
   inner[7] = 1;
   inner[10] = 1;
@@ -1053,16 +1108,24 @@ function collectGenImages(node, out, depth) {
   }
   if (typeof node === "object") for (const k of Object.keys(node)) collectGenImages(node[k], out, depth + 1);
 }
-/** 解析单行 `wrb.fr`,返回 { texts, images }。 */
+/**
+ * 解析单行 `wrb.fr`,返回 { texts, images, meta }。
+ * meta = [cid, rid, rcid] —— Gemini 的会话标识。下一轮把它放进 inner[2]
+ * 就能接着同一个会话聊,不需要重传历史。槽位见 buildPayload() 的注释。
+ * 注意:承载会话 id 的那几行往往没有内容体(inner[4] 为空),所以 meta
+ * 必须在 inner[4] 判断之前先取出来。
+ */
 function extractPartsFromLine(line) {
-  const empty = { texts: [], images: [] };
-  if (!line.includes('"wrb.fr"') || line.length < 200) return empty;
+  const empty = { texts: [], images: [], meta: null };
+  if (!line.includes('"wrb.fr"') || line.length < 40) return empty;
   try {
     const arr = JSON.parse(line);
     const innerStr = arr[0][2];
     if (!innerStr || innerStr.length < 50) return empty;
     const inner = JSON.parse(innerStr);
-    if (!(Array.isArray(inner) && inner.length > 4 && inner[4])) return empty;
+    if (!Array.isArray(inner)) return empty;
+    const meta = extractSessionMeta(inner);
+    if (!(inner.length > 4 && inner[4])) return { texts: [], images: [], meta };
     const texts = [];
     for (const part of inner[4]) {
       if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
@@ -1073,19 +1136,30 @@ function extractPartsFromLine(line) {
     }
     const images = [];
     collectGenImages(inner, images, 0);
-    return { texts, images };
+    return { texts, images, meta };
   } catch (_) {
     return empty;
   }
+}
+/** 从已解析的 inner 里取 [cid, rid, rcid];取不到返回 null。 */
+function extractSessionMeta(inner) {
+  const ids = Array.isArray(inner[1]) ? inner[1] : null;
+  const cid = ids && typeof ids[0] === "string" && ids[0].indexOf("c_") === 0 ? ids[0] : "";
+  const rid = ids && typeof ids[1] === "string" && ids[1].indexOf("r_") === 0 ? ids[1] : "";
+  if (!cid || !rid) return null;
+  let rcid = "";
+  const first = Array.isArray(inner[4]) && Array.isArray(inner[4][0]) ? inner[4][0][0] : "";
+  if (typeof first === "string" && first.indexOf("rc_") === 0) rcid = first;
+  return [cid, rid, rcid];
 }
 /** 兼容旧签名:只要文本。 */
 function extractTextsFromLine(line) {
   return extractPartsFromLine(line).texts;
 }
 /** 把生成图片拼成 Markdown(OpenAI 兼容客户端基本都能渲染)。 */
-function withImages(text, images) {
+function withImages(text, images, cfg) {
   if (!images || !images.length) return text || "";
-  const md = images.map((im) => `![${im.name || "generated image"}](${im.url})`).join("\n");
+  const md = images.map((im) => `![${im.name || "generated image"}](${imageProxyUrl(cfg, im.url)})`).join("\n");
   return text ? `${text}\n\n${md}` : md;
 }
 function extractMarkdownImageUrls(text) {
@@ -1149,12 +1223,14 @@ function checkBardError(raw) {
   const m = /BardErrorInfo[^0-9]{0,20}(\d{3,5})/.exec(raw);
   if (m) throw new BardError(m[1]);
 }
-function extractResponseText(raw) {
+function extractResponseText(raw, cfg) {
   checkBardError(raw);
   let lastText = "";
+  let meta = null;
   const images = [];
   for (const line of raw.split("\n")) {
     const parsed = extractPartsFromLine(line);
+    if (parsed.meta) meta = parsed.meta;
     for (const t of parsed.texts) {
       if (t.length > lastText.length) lastText = t;
     }
@@ -1162,7 +1238,9 @@ function extractResponseText(raw) {
       if (!images.some((x) => x.url === im.url)) images.push(im);
     }
   }
-  return withImages(cleanText(lastText), images);
+  // 回传给路由层,由它落库(下一轮拿它做续聊)。
+  if (cfg && meta) { cfg._session_meta = meta; cfg._metaFresh = true; }
+  return withImages(cleanText(lastText), images, cfg);
 }
 /** 非流式生成(带重试)。返回最终的响应文本。 */
 async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
@@ -1196,7 +1274,7 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
       if (IMAGE_REGION_RE.test(raw)) {
         throw new UpstreamHttpError(502, raw.slice(0, 400));
       }
-      const text = extractResponseText(raw);
+      const text = extractResponseText(raw, cfg);
       // 非 2xx / 机器人校验页:一律当成「出口不可信」,交给上层换出口重试
       if (!resp.ok) throw new UpstreamHttpError(resp.status, raw.slice(0, 400));
       if (!text) {
@@ -1262,7 +1340,7 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
         throw new UpstreamHttpError(resp.status, rawErr.slice(0, 400));
       }
       if (!resp.body) {
-        const text = extractResponseText(await resp.text());
+        const text = extractResponseText(await resp.text(), cfg);
         if (text) {
           yielded = true;
           yield text;
@@ -1277,10 +1355,11 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
       const emittedImages = new Set();
       const consumeLine = function* (line) {
         const parsed = extractPartsFromLine(line);
+        if (parsed.meta) { cfg._session_meta = parsed.meta; cfg._metaFresh = true; }
         for (const im of parsed.images) {
           if (emittedImages.has(im.url)) continue;
           emittedImages.add(im.url);
-          const md = `![${im.name || "generated image"}](${im.url})`;
+          const md = `![${im.name || "generated image"}](${imageProxyUrl(cfg, im.url)})`;
           yield started ? `\n\n${md}` : md;
           started = true;
         }
@@ -1386,6 +1465,12 @@ function messagesToPrompt(messages, tools, toolChoice) {
       );
     }
   }
+  for (const p of renderMessageParts(messages, images)) parts.push(p);
+  return [parts.filter((p) => p).join("\n\n"), images];
+}
+/** 逐条消息渲染成 prompt 片段(不含工具前言)。会话续聊要靠它单独渲染增量。 */
+function renderMessageParts(messages, images) {
+  const parts = [];
   for (const msg of messages) {
     const role = msg.role || "user";
     let content = msg.content != null ? msg.content : "";
@@ -1398,7 +1483,7 @@ function messagesToPrompt(messages, tools, toolChoice) {
         } else {
           const img = imageFromPart(c);
           if (img) {
-            images.push(img);
+            if (images) images.push(img);
             textParts.push("[Image attached]");
           }
         }
@@ -1423,7 +1508,7 @@ function messagesToPrompt(messages, tools, toolChoice) {
       parts.push(content ? content : "");
     }
   }
-  return [parts.filter((p) => p).join("\n\n"), images];
+  return parts;
 }
 /** 提取 ```tool_call``` 代码块 -> [cleanText, toolCalls]。 */
 function parseToolCalls(text) {
@@ -1656,16 +1741,46 @@ async function handleChat(req, cfg, request) {
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
   const tools = req.tools;
   const toolChoice = req.tool_choice != null ? req.tool_choice : "auto";
-  const [prompt0, images] = messagesToPrompt(req.messages || [], tools, toolChoice);
+  const messages = Array.isArray(req.messages) ? req.messages : [];
+  const [promptFull, imagesFull] = messagesToPrompt(messages, tools, toolChoice);
+
+  // 会话:命中续聊时只把新增内容发上去(历史留在 Gemini 侧)
+  const sctx = await prepareSession(cfg, request, req, messages, rm.modeId);
+  const cont = sctx.plan.mode === "continue";
+  const deltaImages = [];
+  let promptBody = promptFull;
+  let images = imagesFull;
+  if (cont) {
+    promptBody = renderSlice(messages, sctx.plan.startIndex, deltaImages);
+    images = deltaImages;
+  }
   const { fileRefs, droppedNote } = await resolveImages(cfg, images);
-  const prompt = prompt0 + droppedNote;
+
+  // 长期记忆:只在开新会话时注入(续聊时 Gemini 的上下文里已经有)
+  let memNote = "";
+  if (!cont && cfg.memory_enabled) {
+    try {
+      const blk = await memoryBlock(cfg, cfg._env, memoryScope(request, req));
+      if (blk) memNote = blk + "\n\n";
+    } catch (_) { /* 记忆读失败不影响主流程 */ }
+  }
+  const prompt = memNote + promptBody + droppedNote;
   if (!prompt.trim()) return jsonResponse({ error: { message: "empty prompt" } }, 400);
   const stream = req.stream || false;
   const cid = `chatcmpl-${randHex(12)}`;
+  const finishTurn = async (ok, answer) => {
+    try { await endTurn(cfg, sctx, ok, messages, rm.modeId); } catch (_) { /* ignore */ }
+    if (ok && cfg.memory_auto_extract && cfg._ctx && cfg._env && cfg._env.DB) {
+      const scope = memoryScope(request, req);
+      const userText = firstUserText(messages);
+      try { cfg._ctx.waitUntil(autoExtractMemory(cfg, cfg._env, scope, userText, answer)); } catch (_) { /* ignore */ }
+    }
+  };
   if (stream && (!tools || toolChoice === "none")) {
     return sseResponse(async (write) => {
       let got = false;
       let errMsg = "";
+      let acc = "";
       const chunk = (delta, finish) => write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
         choices: [{ index: 0, delta, finish_reason: finish }],
@@ -1674,6 +1789,7 @@ async function handleChat(req, cfg, request) {
       try {
         for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
           got = true;
+          acc += delta;
           chunk({ content: delta }, null);
         }
       } catch (e) {
@@ -1684,6 +1800,7 @@ async function handleChat(req, cfg, request) {
           log(cfg, `chat stream produced no content -> ${note}`);
           chunk({ content: note }, null); // 让客户端看到原因,而非空白
         }
+        await finishTurn(got, acc);
         chunk({}, "stop");
         write("data: [DONE]\n\n");
       }
@@ -1693,6 +1810,7 @@ async function handleChat(req, cfg, request) {
   try {
     text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
   } catch (e) {
+    await finishTurn(false, "");
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
   let toolCalls = null;
@@ -1705,6 +1823,7 @@ async function handleChat(req, cfg, request) {
     log(cfg, "chat non-stream produced no content (empty upstream)");
     text = EMPTY_UPSTREAM_MSG; // 可见提示,避免客户端“无返回”
   }
+  await finishTurn(true, text);
   const msg = { role: "assistant", content: text || null };
   if (toolCalls) msg.tool_calls = toolCalls;
   // 生成图片:正文里已经是 Markdown;再挂一份结构化 images[](兼容 Cherry Studio 之类的客户端)
@@ -1738,24 +1857,31 @@ function clientIp(request) {
 // 每个 isolate 内的滑动窗口限流。Cloudflare 会在多个 isolate 间分担请求,
 // 因此它是近似限流,不依赖 KV/D1,避免每个 API 调用都增加一次存储写入。
 const RATE_LIMIT_STORE = new Map();
-function checkRateLimit(clientIP, cfg) {
-  if (!cfg || !cfg.rate_limit_enabled) return true;
+const IMG_RATE_STORE = new Map();
+/** 通用滑动窗口计数。低频清理冷 key,防止 isolate 长生命周期内 Map 无限增长。 */
+function slidingLimit(store, clientIP, max, windowMs) {
   const now = Date.now();
-  const windowMs = Math.max(1, cfg.rate_limit_window) * 1000;
   const key = clientIP || "0.0.0.0";
-  const hits = (RATE_LIMIT_STORE.get(key) || []).filter((ts) => now - ts < windowMs);
-  if (hits.length >= Math.max(1, cfg.rate_limit_max)) return false;
+  const hits = (store.get(key) || []).filter((ts) => now - ts < windowMs);
+  if (hits.length >= Math.max(1, max)) return false;
   hits.push(now);
-  RATE_LIMIT_STORE.set(key, hits);
-  // 低频清理冷 IP,防止 isolate 长生命周期内 Map 无限增长。
+  store.set(key, hits);
   if (Math.random() < 0.05) {
-    for (const [k, values] of RATE_LIMIT_STORE) {
+    for (const [k, values] of store) {
       const valid = values.filter((ts) => now - ts < windowMs);
-      if (valid.length) RATE_LIMIT_STORE.set(k, valid);
-      else RATE_LIMIT_STORE.delete(k);
+      if (valid.length) store.set(k, valid);
+      else store.delete(k);
     }
   }
   return true;
+}
+function checkRateLimit(clientIP, cfg) {
+  if (!cfg || !cfg.rate_limit_enabled) return true;
+  return slidingLimit(RATE_LIMIT_STORE, clientIP, cfg.rate_limit_max, Math.max(1, cfg.rate_limit_window) * 1000);
+}
+/** /img 是公开端点(不带 API key),单独限流,防止被刷爆 R2 读次数。 */
+function checkImgRate(clientIP, cfg) {
+  return slidingLimit(IMG_RATE_STORE, clientIP, cfg.image_proxy_rate_max || 600, 60000);
 }
 // POST /v1/responses(Codex CLI 用)
 async function handleResponses(req, cfg, request) {
@@ -1817,16 +1943,36 @@ async function handleResponses(req, cfg, request) {
     );
   }
   const toolChoice = req.tool_choice != null ? req.tool_choice : "auto";
-  const [prompt0, images] = messagesToPrompt(messages, tools, toolChoice);
+  const [promptFull, imagesFull] = messagesToPrompt(messages, tools, toolChoice);
+
+  // 与 /v1/chat/completions 同一套会话/记忆逻辑
+  const sctx = await prepareSession(cfg, request, req, messages, rm.modeId);
+  const cont = sctx.plan.mode === "continue";
+  const deltaImages = [];
+  let promptBody = promptFull;
+  let images = imagesFull;
+  if (cont) {
+    promptBody = renderSlice(messages, sctx.plan.startIndex, deltaImages);
+    images = deltaImages;
+  }
   const { fileRefs, droppedNote } = await resolveImages(cfg, images);
-  const prompt = prompt0 + droppedNote;
+  let memNote = "";
+  if (!cont && cfg.memory_enabled) {
+    try {
+      const blk = await memoryBlock(cfg, cfg._env, memoryScope(request, req));
+      if (blk) memNote = blk + "\n\n";
+    } catch (_) { /* ignore */ }
+  }
+  const prompt = memNote + promptBody + droppedNote;
   if (!prompt.trim()) return jsonResponse({ error: { message: "empty input" } }, 400);
   let text;
   try {
     text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
   } catch (e) {
+    try { await endTurn(cfg, sctx, false, messages, rm.modeId); } catch (_) { /* ignore */ }
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
+  try { await endTurn(cfg, sctx, true, messages, rm.modeId); } catch (_) { /* ignore */ }
   let toolCalls = null;
   if (tools && text && toolChoice !== "none") {
     const [clean, tc] = parseToolCalls(text);
@@ -2103,6 +2249,539 @@ async function refreshSession(cfg, origin) {
     cookie, xsrf, bl,
   };
 }
+// ════════════════════════════════════════════════════════════════════════════
+//  会话记忆(服务端续聊)+ 长期记忆 + 生成图片中转
+//
+//  设计要点:
+//   · 会话:把 [cid, rid, rcid] 存进 D1,下一轮塞回 inner[2],只发增量。
+//     客户端仍然可以整段历史照发 —— 我们用 [渲染指纹 + 条数] 校验前缀,
+//     对得上就只把「新增的那几条」发上去,对不上就当新会话(不会串话)。
+//   · 记忆:跨会话的事实,存 D1,开新会话时注入 prompt;续聊不重复注入
+//     (Gemini 侧上下文里已经有了)。
+//   · 图片:上游直链改写成 <PUBLIC_ORIGIN>/img/<key>,自己回源 + 缓存。
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 128 位同步哈希。必须是同步的 —— 图片 URL 重写发生在拼装文本的同步路径里,
+ * 而 crypto.subtle.digest 是异步的。仅用于指纹 / 缓存键,不做安全用途。
+ */
+function syncHash(str) {
+  const s = String(str == null ? "" : str);
+  let a = 0x811c9dc5, b = 0x1000193, c = 0xcbf29ce4, d = 0x9e3779b9;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    const lo = ch & 0xff, hi = ch >>> 8;
+    a = Math.imul(a ^ lo, 0x01000193) >>> 0;
+    b = Math.imul(b ^ hi, 0x01000193) >>> 0;
+    c = (c + Math.imul(lo + i, 0x27d4eb2f)) >>> 0;
+    d = (d ^ Math.imul(hi + i + 1, 0x165667b1)) >>> 0;
+  }
+  const hx = (n) => (n >>> 0).toString(16).padStart(8, "0");
+  return hx(a) + hx(b) + hx(c) + hx(d);
+}
+function b64urlEncode(str) {
+  const bytes = new TextEncoder().encode(String(str));
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s) {
+  const t = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = t.length % 4 ? "=".repeat(4 - (t.length % 4)) : "";
+  const bin = atob(t + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(out);
+}
+
+// ── D1 schema ───────────────────────────────────────────────────────────────
+// 会话/记忆优先落 D1(免费额度 10 万行写/天);没绑 D1 时会话退回 KV(只有
+// 1000 写/天,够单机自用,记忆则整体关闭)。
+const DDL = [
+  "CREATE TABLE IF NOT EXISTS chat_sessions (sid TEXT PRIMARY KEY, cid TEXT NOT NULL, rid TEXT NOT NULL, " +
+    "rcid TEXT, model TEXT, nmsgs INTEGER DEFAULT 0, phash TEXT, delta_mode INTEGER DEFAULT 0, " +
+    "turns INTEGER DEFAULT 0, created_ts INTEGER, updated_ts INTEGER)",
+  "CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_ts)",
+  "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, scope TEXT NOT NULL, content TEXT NOT NULL, " +
+    "source TEXT, created_ts INTEGER, updated_ts INTEGER)",
+  "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, updated_ts)",
+  "CREATE TABLE IF NOT EXISTS img_map (hash TEXT PRIMARY KEY, url TEXT NOT NULL, ts INTEGER)",
+  "CREATE TABLE IF NOT EXISTS img_budget (k TEXT PRIMARY KEY, v INTEGER DEFAULT 0)",
+];
+let _schemaReady = false;
+let _schemaPromise = null;
+/** 幂等建表(每个 isolate 只做一次)。 */
+async function ensureSchema(env) {
+  if (!env || !env.DB) return false;
+  if (_schemaReady) return true;
+  if (!_schemaPromise) {
+    _schemaPromise = (async () => {
+      for (const stmt of DDL) {
+        try { await env.DB.prepare(stmt).run(); } catch (_) { /* 已存在 / 并发建表 */ }
+      }
+      _schemaReady = true;
+      return true;
+    })().catch(() => { _schemaPromise = null; return false; });
+  }
+  return _schemaPromise;
+}
+
+// ── 会话读写 ───────────────────────────────────────────────────────────────
+async function sessionGet(env, sid) {
+  if (!env || !sid) return null;
+  if (env.DB) {
+    try {
+      await ensureSchema(env);
+      const row = await env.DB.prepare("SELECT * FROM chat_sessions WHERE sid = ?1").bind(sid).first();
+      if (row) return row;
+    } catch (_) { /* 退回 KV */ }
+  }
+  if (env.STATE) {
+    try { return (await env.STATE.get("sess:" + sid, "json")) || null; } catch (_) { /* ignore */ }
+  }
+  return null;
+}
+const SESSION_UPSERT =
+  "INSERT INTO chat_sessions (sid, cid, rid, rcid, model, nmsgs, phash, delta_mode, turns, created_ts, updated_ts) " +
+  "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) " +
+  "ON CONFLICT(sid) DO UPDATE SET cid=excluded.cid, rid=excluded.rid, rcid=excluded.rcid, " +
+  "model=excluded.model, nmsgs=excluded.nmsgs, phash=excluded.phash, delta_mode=excluded.delta_mode, " +
+  "turns=excluded.turns, updated_ts=excluded.updated_ts";
+async function sessionPut(env, sid, row, ttlSec) {
+  if (!env || !sid || !row) return false;
+  if (env.DB) {
+    try {
+      await ensureSchema(env);
+      await env.DB.prepare(SESSION_UPSERT).bind(
+        sid, String(row.cid), String(row.rid), row.rcid ? String(row.rcid) : null,
+        row.model != null ? String(row.model) : null, row.nmsgs | 0, row.phash || "",
+        row.delta_mode ? 1 : 0, row.turns | 0, row.created_ts || Date.now(), Date.now()
+      ).run();
+      return true;
+    } catch (e) { log({ log_requests: true }, `会话写入 D1 失败: ${e}`); }
+  }
+  if (env.STATE) {
+    try {
+      await env.STATE.put("sess:" + sid, JSON.stringify(row), { expirationTtl: Math.max(60, ttlSec || 604800) });
+      return true;
+    } catch (_) { /* ignore */ }
+  }
+  return false;
+}
+
+// ── 会话键:显式 > user 字段 > 隐式(同一 key + 同一首条用户消息)──────────
+function firstUserText(messages) {
+  if (!Array.isArray(messages)) return "";
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    if (m.role && m.role !== "user") continue;
+    const c = m.content;
+    if (typeof c === "string" && c.trim()) return c.trim();
+    if (Array.isArray(c)) {
+      const t = c.map((x) => (x && typeof x === "object" ? (x.text || x.input_text || "") : ""))
+                 .filter(Boolean).join(" ").trim();
+      if (t) return t;
+    }
+  }
+  return "";
+}
+function sessionKey(cfg, request, req, messages) {
+  let h = null;
+  try { h = request && request.headers; } catch (_) { h = null; }
+  const hdr = (h && (h.get("x-session-id") || h.get("x-conversation-id") || h.get("x-chat-id"))) || "";
+  if (String(hdr).trim()) return { raw: "h:" + String(hdr).trim(), explicit: true, source: "header" };
+  for (const k of ["session_id", "conversation_id", "chat_id"]) {
+    if (req && typeof req[k] === "string" && req[k].trim()) {
+      return { raw: "h:" + req[k].trim(), explicit: true, source: k };
+    }
+  }
+  if (req && typeof req.user === "string" && req.user.trim()) {
+    return { raw: "u:" + req.user.trim(), explicit: true, source: "user" };
+  }
+  const first = firstUserText(messages);
+  if (!first) return { raw: "", explicit: false, source: "" };
+  let auth = "";
+  try {
+    auth = String((h && (h.get("authorization") || h.get("x-api-key"))) || "");
+  } catch (_) { auth = ""; }
+  auth = auth.replace(/^Bearer\s+/i, "");
+  return { raw: "i:" + syncHash(auth).slice(0, 12) + ":" + first.slice(0, 2000), explicit: false, source: "implicit" };
+}
+/** 客户端声明「只发增量」时必须显式给会话 id,否则无法校验。 */
+function deltaModeRequested(cfg, request, req) {
+  let v = "";
+  try { v = (request && request.headers && request.headers.get("x-session-mode")) || ""; } catch (_) { v = ""; }
+  if (!v && req && typeof req.session_mode === "string") v = req.session_mode;
+  v = String(v || "").toLowerCase();
+  if (v === "delta" || v === "incremental") return true;
+  if (v === "full" || v === "history") return false;
+  return !!cfg.session_delta_default;
+}
+/** 渲染一段消息数组 → prompt 字符串(不含工具前言),用于指纹与增量。 */
+function renderSlice(messages, from, images) {
+  return renderMessageParts(messages.slice(from), images).filter((p) => p).join("\n\n");
+}
+/**
+ * 对「前 count 条消息」的渲染结果取指纹。续聊时用同一函数算客户端前缀,
+ * 对得上才说明客户端发来的历史和我们上次发出去的是一致的。
+ */
+function messageHash(messages, count) {
+  const list = Array.isArray(messages) ? messages : [];
+  const n = Math.max(0, Math.min(count == null ? list.length : count, list.length));
+  return syncHash(renderMessageParts(list.slice(0, n), null).filter((p) => p).join("\n\n"));
+}
+
+/**
+ * 决定这一轮怎么发。
+ *   mode="continue":只把 messages.slice(startIndex) 发上去,inner[2] 带会话 id
+ *   mode="new"     :整段历史照发,开新会话
+ */
+function planTurn(cfg, sess, messages, modelId, deltaOK) {
+  const out = { mode: "new", startIndex: 0, reason: "" };
+  if (!sess || !sess.cid || !sess.rid) { out.reason = "no-session"; return out; }
+  const ttlMs = Math.max(60, cfg.session_ttl_sec || 604800) * 1000;
+  if (Date.now() - Number(sess.updated_ts || 0) > ttlMs) { out.reason = "expired"; return out; }
+  if (sess.model && modelId != null && String(sess.model) !== String(modelId)) { out.reason = "model-changed"; return out; }
+  // ① 本次请求显式声明「只发增量」:收到的整段就是增量,不用校验。
+  //    必须在最前面判断 —— 此时 messages 里没有历史,前缀校验必然对不上。
+  if (deltaOK) {
+    out.mode = "continue";
+    out.startIndex = 0;
+    out.reason = "delta-mode";
+    return out;
+  }
+  // ② 客户端照发整段历史:用 [条数 + 渲染指纹] 校验前缀,对得上只发新增部分。
+  const sent = Number(sess.nmsgs || 0);
+  if (sent > 0 && sent < messages.length && sess.phash && messageHash(messages, sent) === sess.phash) {
+    // 跳过客户端回显的那条 assistant 回复,其余(新的 user / tool 结果)发上去
+    let i = sent;
+    while (i < messages.length) {
+      const m = messages[i] || {};
+      if (m.role === "assistant" && !m.tool_calls) { i++; continue; }
+      break;
+    }
+    if (i < messages.length) {
+      out.mode = "continue";
+      out.startIndex = i;
+      out.reason = "prefix-match";
+      return out;
+    }
+    out.reason = "nothing-new";
+    return out;
+  }
+  out.reason = sent === 0 ? "no-prefix" : "history-diverged";
+  return out;
+}
+
+/** 开聊前:取会话、定本轮怎么发。命中续聊时把 cfg._session_meta 设好。 */
+async function prepareSession(cfg, request, req, messages, modelId) {
+  const off = { sid: "", sess: null, explicit: false, source: "", model: modelId,
+                plan: { mode: "new", startIndex: 0, reason: "off" } };
+  if (!cfg.session_memory) return off;
+  const env = cfg._env;
+  if (!env || (!env.DB && !env.STATE)) return Object.assign(off, { plan: { mode: "new", startIndex: 0, reason: "no-storage" } });
+  const key = sessionKey(cfg, request, req, messages);
+  if (!key.raw) return Object.assign(off, { plan: { mode: "new", startIndex: 0, reason: "no-key" } });
+  cfg._metaFresh = false;
+  const sid = syncHash(key.raw);
+  let sess = null;
+  try { sess = await sessionGet(env, sid); } catch (_) { sess = null; }
+  const deltaOK = key.explicit && deltaModeRequested(cfg, request, req);
+  const plan = planTurn(cfg, sess, messages, modelId, deltaOK);
+  if (plan.mode === "continue" && sess) cfg._session_meta = [sess.cid, sess.rid, sess.rcid || ""];
+  return { sid, sess, explicit: key.explicit, source: key.source, model: modelId, plan, deltaOK };
+}
+
+/** 一轮结束后:落库会话 + 把本轮图片 URL→key 映射写进 D1。 */
+async function endTurn(cfg, sctx, ok, messages, modelId) {
+  try { await flushImageMap(cfg); } catch (_) { /* ignore */ }
+  if (!ok || !sctx || !sctx.sid) return;
+  const env = cfg._env;
+  if (!env || (!env.DB && !env.STATE)) return;
+  const meta = cfg._session_meta;
+  // 只有「响应里确实带回新会话 id」才推进会话状态。否则保持原样 ——
+  // 免得把 nmsgs/phash 推进了、Gemini 侧其实没接上,下一轮增量就丢内容。
+  if (!cfg._metaFresh) return;
+  if (!meta || !meta[0] || !meta[1]) return;
+  const deltaMode = !!sctx.deltaOK;
+  const row = {
+    sid: sctx.sid,
+    cid: String(meta[0]),
+    rid: String(meta[1]),
+    rcid: meta[2] ? String(meta[2]) : "",
+    model: modelId != null ? String(modelId) : null,
+    nmsgs: deltaMode ? 0 : (Array.isArray(messages) ? messages.length : 0),
+    phash: deltaMode ? "" : messageHash(messages, Array.isArray(messages) ? messages.length : 0),
+    delta_mode: deltaMode,
+    turns: Number((sctx.sess && sctx.sess.turns) || 0) + 1,
+    created_ts: Number((sctx.sess && sctx.sess.created_ts) || 0) || Date.now(),
+  };
+  sctx.sess = row;
+  try { await sessionPut(env, sctx.sid, row, cfg.session_ttl_sec); } catch (_) { /* ignore */ }
+  log(cfg, `session ${sctx.sid.slice(0, 8)} ${sctx.plan.mode}/${sctx.plan.reason} turns=${row.turns} msgs=${row.nmsgs}`);
+}
+
+// ── 长期记忆 ───────────────────────────────────────────────────────────────
+function memoryScope(request, req) {
+  try {
+    const h = request && request.headers && request.headers.get("x-memory-scope");
+    if (h && h.trim()) return h.trim().slice(0, 200);
+  } catch (_) { /* ignore */ }
+  if (req && typeof req.memory_scope === "string" && req.memory_scope.trim()) return req.memory_scope.trim().slice(0, 200);
+  if (req && typeof req.user === "string" && req.user.trim()) return req.user.trim().slice(0, 200);
+  return "default";
+}
+async function memoryList(env, scope, limit) {
+  if (!env || !env.DB) return [];
+  try {
+    await ensureSchema(env);
+    const r = await env.DB.prepare(
+      "SELECT id, content, source, created_ts, updated_ts FROM memories WHERE scope = ?1 ORDER BY updated_ts DESC LIMIT ?2"
+    ).bind(scope, limit || 500).all();
+    return (r && r.results) || [];
+  } catch (_) { return []; }
+}
+async function memoryAdd(env, scope, content, source) {
+  const text = String(content || "").trim();
+  if (!env || !env.DB || !text) return null;
+  await ensureSchema(env);
+  const id = randHex(16);
+  const now = Date.now();
+  await env.DB.prepare(
+    "INSERT INTO memories (id, scope, content, source, created_ts, updated_ts) VALUES (?1,?2,?3,?4,?5,?6)"
+  ).bind(id, scope, text, source || "api", now, now).run();
+  return id;
+}
+async function memoryGc(env, scope, maxItems) {
+  if (!env || !env.DB || !maxItems) return;
+  try {
+    await env.DB.prepare(
+      "DELETE FROM memories WHERE scope = ?1 AND id NOT IN (" +
+      "SELECT id FROM memories WHERE scope = ?1 ORDER BY updated_ts DESC LIMIT ?2)"
+    ).bind(scope, maxItems).run();
+  } catch (_) { /* ignore */ }
+}
+/** 记忆块 —— 只在开新会话时注入。 */
+async function memoryBlock(cfg, env, scope) {
+  if (!cfg.memory_enabled || !env || !env.DB) return "";
+  const rows = await memoryList(env, scope, cfg.memory_max_items);
+  if (!rows.length) return "";
+  const cap = cfg.memory_inject_max_bytes || 0;
+  const lines = [];
+  let bytes = 0;
+  for (const r of rows) {
+    const line = "- " + String(r.content).replace(/\s+/g, " ").trim();
+    const len = new TextEncoder().encode(line).length + 1;
+    if (cap && bytes + len > cap) break;
+    bytes += len;
+    lines.push(line);
+  }
+  if (!lines.length) return "";
+  return "[长期记忆 · 请在后续回答中遵循]\n" + lines.join("\n") + "\n[/长期记忆]";
+}
+
+// ── 生成图片中转 ───────────────────────────────────────────────────────────
+// 上游直链(googleusercontent.com,而且 gg-dl 带签名会过期)用户那边往往加载
+// 不出来。这里改写成自家域名,自己回源并缓存到 R2 + 边缘。
+const IMG_KEY_RE = /^[0-9a-f]{16,64}$/;
+function imgKeyOf(cfg, url) {
+  return syncHash((cfg && cfg.public_origin ? cfg.public_origin : "") + "|" + url).slice(0, 24);
+}
+/** 同步路径:把 googleusercontent 直链换成 <PUBLIC_ORIGIN>/img/<key>。 */
+function imageProxyUrl(cfg, url) {
+  if (!cfg || cfg.image_proxy === false) return url;
+  if (!url || !IMG_URL_RE.test(url)) return url;
+  const env = cfg._env;
+  if (!env || (!env.DB && !env.FILECACHE)) return url;
+  if (!cfg.public_origin) return url; // 没配对外域名就保持直链,免得给个打不开的地址
+  const key = imgKeyOf(cfg, url);
+  if (!cfg._imgPending) cfg._imgPending = new Map();
+  if (!cfg._imgPending.has(key)) cfg._imgPending.set(key, url);
+  return cfg.public_origin + "/img/" + key;
+}
+/** 把本轮 URL→key 映射落进 D1(/img/<key> 靠它反查原图)。 */
+async function flushImageMap(cfg) {
+  const pend = cfg && cfg._imgPending;
+  if (!pend || !pend.size) return;
+  cfg._imgPending = null;
+  const env = cfg._env;
+  if (!env || !env.DB) return;
+  try {
+    await ensureSchema(env);
+    const ts = Date.now();
+    const stmts = [];
+    for (const [k, u] of pend) {
+      stmts.push(env.DB.prepare(
+        "INSERT INTO img_map (hash, url, ts) VALUES (?1, ?2, ?3) ON CONFLICT(hash) DO UPDATE SET url = excluded.url, ts = excluded.ts"
+      ).bind(k, u, ts));
+    }
+    if (stmts.length) await env.DB.batch(stmts);
+  } catch (e) { log(cfg, `img_map 写入失败(不影响出图): ${e}`); }
+}
+function monthKey() {
+  const d = new Date();
+  return "b:" + d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0");
+}
+/** R2 月度写入预算:超额就不再落 R2(图照常显示,只是不缓存)。 */
+async function r2BudgetAllow(cfg, env, size) {
+  const cap = Number(cfg.image_r2_monthly_max_bytes || 0);
+  if (!cap) return false;
+  if (!env.DB) return true;
+  try {
+    const row = await env.DB.prepare("SELECT v FROM img_budget WHERE k = ?1").bind(monthKey()).first();
+    return Number((row && row.v) || 0) + size <= cap;
+  } catch (_) { return true; }
+}
+async function r2BytesAdd(env, size) {
+  if (!env || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      "INSERT INTO img_budget (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = v + excluded.v"
+    ).bind(monthKey(), size).run();
+  } catch (_) { /* ignore */ }
+}
+async function storeImageR2(cfg, env, key, bytes, mime) {
+  if (!env || !env.FILECACHE) return false;
+  if (cfg.image_r2_store === false) return false;
+  if (bytes.byteLength > Number(cfg.image_object_max_bytes || 12582912)) return false;
+  if (!(await r2BudgetAllow(cfg, env, bytes.byteLength))) {
+    log(cfg, "R2 图片月度预算已用尽,本次只走边缘缓存");
+    return false;
+  }
+  try {
+    await env.FILECACHE.put("img/" + key, bytes, {
+      httpMetadata: { contentType: mime || "image/png", cacheControl: `public, max-age=${cfg.image_cache_ttl_sec || 604800}` },
+    });
+    await r2BytesAdd(env, bytes.byteLength);
+    return true;
+  } catch (e) { log(cfg, `R2 写入失败: ${e}`); return false; }
+}
+const IMG_UPSTREAM_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+  "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+  "Referer": "https://gemini.google.com/",
+};
+/**
+ * GET /img/<key> —— 公开端点。<img> 标签发不出 Authorization 头,所以用
+ * 「不可猜的 key」当凭据;key 只由 googleusercontent 白名单 URL 生成,
+ * 不构成任意 URL 代理(SSRF)。
+ */
+async function handleImageProxy(key, request, cfg, env) {
+  const base = {
+    ...corsHeaders(),
+    "Cache-Control": `public, max-age=${Math.max(60, cfg.image_cache_ttl_sec || 604800)}`,
+    "X-Content-Type-Options": "nosniff",
+  };
+  if (!IMG_KEY_RE.test(String(key || ""))) return new Response("bad image key", { status: 400, headers: base });
+  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
+  const cacheKey = new Request(new URL(request.url).toString(), { method: "GET" });
+  if (cache) { try { const hit = await cache.match(cacheKey); if (hit) return hit; } catch (_) { /* ignore */ } }
+
+  // ① R2(持久层)
+  if (env.FILECACHE) {
+    try {
+      const obj = await env.FILECACHE.get("img/" + key);
+      if (obj) {
+        const mime = (obj.httpMetadata && obj.httpMetadata.contentType) || "image/png";
+        const res = new Response(obj.body, { status: 200, headers: { ...base, "Content-Type": mime } });
+        if (cache) { try { await cache.put(cacheKey, res.clone()); } catch (_) { /* ignore */ } }
+        return res;
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  // ② D1 反查原图(丢了映射还能用 ?s=<base64url> 兜底)
+  let src = "";
+  if (env.DB) {
+    try {
+      await ensureSchema(env);
+      const row = await env.DB.prepare("SELECT url FROM img_map WHERE hash = ?1").bind(key).first();
+      src = (row && row.url) || "";
+    } catch (_) { /* ignore */ }
+  }
+  if (!src) {
+    const q = new URL(request.url).searchParams.get("s");
+    if (q) { try { const d = b64urlDecode(q); if (IMG_URL_RE.test(d)) src = d; } catch (_) { /* ignore */ } }
+  }
+  if (!src || !IMG_URL_RE.test(src)) return new Response("image not found", { status: 404, headers: base });
+
+  // ③ 回源 + 回填
+  let up;
+  try {
+    up = await fetch(src, { headers: IMG_UPSTREAM_HEADERS, redirect: "follow" });
+  } catch (e) {
+    return new Response("upstream fetch failed: " + String((e && e.message) || e), { status: 502, headers: base });
+  }
+  if (!up.ok) return new Response("upstream " + up.status, { status: 502, headers: base });
+  const ctype = String(up.headers.get("content-type") || "image/png").split(";")[0].trim();
+  if (!ctype.startsWith("image/")) return new Response("upstream is not an image", { status: 502, headers: base });
+  const bytes = new Uint8Array(await up.arrayBuffer());
+  if (!bytes.byteLength) return new Response("empty upstream body", { status: 502, headers: base });
+  const res = new Response(bytes, { status: 200, headers: { ...base, "Content-Type": ctype, "Content-Length": String(bytes.byteLength) } });
+  if (cache) { try { await cache.put(cacheKey, res.clone()); } catch (_) { /* ignore */ } }
+  try { await storeImageR2(cfg, env, key, bytes, ctype); } catch (_) { /* ignore */ }
+  return res;
+}
+
+// ── 记忆 HTTP 接口 ─────────────────────────────────────────────────────────
+async function handleMemories(request, cfg, env, url, method, req) {
+  const scope = memoryScope(request, req);
+  if (!env || !env.DB) return jsonResponse({ error: { message: "memory requires the D1 binding" } }, 503);
+  try {
+    if (method === "GET") {
+      const rows = await memoryList(env, scope, cfg.memory_max_items);
+      return jsonResponse({ object: "list", scope, data: rows.map((r) => ({ id: r.id, content: r.content, source: r.source, updated_at: r.updated_ts })) });
+    }
+    if (req === null || req === undefined) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+    if (method === "POST") {
+      const items = Array.isArray(req.memories) ? req.memories : [req];
+      const ids = [];
+      for (const it of items) {
+        const content = typeof it === "string" ? it : (it && (it.content || it.text)) || "";
+        if (!String(content).trim()) continue;
+        const id = await memoryAdd(env, scope, content, (it && it.source) || "api");
+        if (id) ids.push(id);
+      }
+      await memoryGc(env, scope, cfg.memory_max_items);
+      return jsonResponse({ object: "list", scope, created: ids });
+    }
+    if (method === "DELETE") {
+      const id = req.id || url.searchParams.get("id") || "";
+      if (id) {
+        await env.DB.prepare("DELETE FROM memories WHERE id = ?1 AND scope = ?2").bind(String(id), scope).run();
+        return jsonResponse({ deleted: 1, id });
+      }
+      const r = await env.DB.prepare("DELETE FROM memories WHERE scope = ?1").bind(scope).run();
+      return jsonResponse({ deleted: (r && r.meta && r.meta.changes) || 0, scope });
+    }
+  } catch (e) {
+    return jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
+  }
+  return jsonResponse({ error: "method not allowed" }, 405);
+}
+/**
+ * 自动提炼记忆(默认关)。每轮结束后台跑一次,让上游从这轮对话里挑出
+ * 「值得长期记住」的事实。会多消耗一次上游请求。
+ */
+async function autoExtractMemory(cfg, env, scope, userText, assistantText) {
+  try {
+    const ask =
+      "从下面这轮对话里提取值得长期记住的用户信息(偏好、身份、长期目标、约定)。\n" +
+      "只输出 JSON 数组,每项一行字符串;没有值得记的就输出 []。不要解释。\n\n" +
+      "[用户]: " + String(userText || "").slice(0, 4000) + "\n" +
+      "[助手]: " + String(assistantText || "").slice(0, 4000);
+    const text = await generate(cfg, ask, 1, 1, null, null);
+    const m = /\[[\s\S]*\]/.exec(text || "");
+    if (!m) return;
+    const arr = JSON.parse(m[0]);
+    if (!Array.isArray(arr) || !arr.length) return;
+    for (const item of arr.slice(0, 5)) {
+      if (typeof item === "string" && item.trim()) await memoryAdd(env, scope, item, "auto");
+    }
+    await memoryGc(env, scope, cfg.memory_max_items);
+  } catch (_) { /* 记忆提炼失败不影响主流程 */ }
+}
+
 // ─── 路由 ────────────────────────────────────────────────────────────────────
 // Durable Object regional relay. locationHint selects the egress region.
 const EGRESS_HINTS = new Set(["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"]);
@@ -2175,16 +2854,25 @@ export default {
   async fetch(request, env, ctx) {
     const cfg = getConfig(env);
     await hydrateState(cfg, env);
+    cfg._ctx = ctx;
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
     if (method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: { ...corsHeaders(), "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "*" },
+        headers: { ...corsHeaders(), "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS", "Access-Control-Allow-Headers": "*" },
       });
     }
     cfg.client_ip = clientIp(request);
+    // 生成图片中转:公开端点 —— <img> 标签发不出 Authorization 头,
+    // 所以以「不可猜的 key」当凭据,并单独限流防刷。
+    if (method === "GET" && path.indexOf("/img/") === 0) {
+      if (!checkImgRate(cfg.client_ip, cfg)) {
+        return new Response("too many requests", { status: 429, headers: corsHeaders() });
+      }
+      return await handleImageProxy(path.slice(5), request, cfg, env);
+    }
     const isHealthPath = path === "/" || path === "/health" || path === "/healthz";
     if (!isHealthPath && !checkRateLimit(cfg.client_ip, cfg)) {
       log(cfg, `rate limit exceeded: ${cfg.client_ip || "0.0.0.0"}`);
@@ -2253,11 +2941,21 @@ export default {
             egress_hint: cfg.egress_hint || "",
             rate_limit: cfg.rate_limit_enabled ? { max: cfg.rate_limit_max, window_sec: cfg.rate_limit_window } : { enabled: false },
             fingerprint_jitter_ms: cfg.fingerprint_jitter_ms,
+            session_memory: !!cfg.session_memory,
+            session_ttl_sec: cfg.session_ttl_sec,
+            memory: !!cfg.memory_enabled,
+            memory_auto_extract: !!cfg.memory_auto_extract,
+            image_proxy: !!cfg.image_proxy,
+            public_origin: cfg.public_origin || "",
+            r2_bound: !!env.FILECACHE,
             ts: Date.now(),
           });
         }
         if (path === "/debug") {
           return await handleDebug(cfg, request);
+        }
+        if (path === "/v1/memories") {
+          return await handleMemories(request, cfg, env, url, "GET");
         }
         if (path === "/admin/state") {
           if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
@@ -2277,6 +2975,9 @@ export default {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await handleRawDebug(req, cfg);
         }
+        if (path === "/v1/memories") {
+          return await handleMemories(request, cfg, env, url, "POST", req);
+        }
         if (path === "/v1/chat/completions") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await berrRetry(() => handleChat(req, cfg, request));
@@ -2293,6 +2994,13 @@ export default {
         if (path.includes(":generateContent")) {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await berrRetry(() => handleGoogleGenerate(req, cfg, path, false, request));
+        }
+        return jsonResponse({ error: "not found" }, 404);
+      }
+      if (method === "DELETE") {
+        if (path === "/v1/memories") {
+          const bodyText = await request.text().catch(() => "");
+          return await handleMemories(request, cfg, env, url, "DELETE", parseJson(bodyText));
         }
         return jsonResponse({ error: "not found" }, 404);
       }
@@ -2502,4 +3210,6 @@ export {
   refreshSession, readState, saveState, hydrateState, mergeSetCookies, extractSapisid,
   UpstreamHttpError, isUpstreamHttpError, isRetryableUpstream, retryDelayMs, useSocket,
   fileRefCacheKey, pickFingerprint, handleRawDebug,
+  syncHash, extractSessionMeta, sessionKey, planTurn, messageHash, renderSlice, renderMessageParts,
+  memoryBlock, memoryList, memoryAdd, memoryScope, imageProxyUrl, imgKeyOf, handleImageProxy,
 };
