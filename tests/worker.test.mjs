@@ -14,6 +14,8 @@ import {
   parseToolCalls,
   cleanText,
   getConfig,
+  MODELS,
+  resolveModel,
 } from "../worker.js";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -150,6 +152,28 @@ test("normalizeMimeType maps image/jpg to image/jpeg", () => {
   assert.equal(normalizeMimeType("image/jpg"), "image/jpeg");
   assert.equal(normalizeMimeType("IMAGE/JPEG; charset=x"), "image/jpeg");
   assert.equal(normalizeMimeType("", "image/png"), "image/png");
+});
+
+test("model table exposes 3.8 and extended thinking, and resolves to the right enums", () => {
+  // 网页端模式选择器实测(2026-09-25):3.5 Flash-Lite / 3.8 Flash / 3.1 Pro / 扩展思考。
+  // 抓下网页真实 payload 确认「3.8 Flash」用的就是 inner[79]=1。
+  assert.ok(MODELS["gemini-3.8-flash"], "3.8 flash must exist");
+  assert.equal(MODELS["gemini-3.8-flash"].mode, 1);
+  assert.ok(MODELS["gemini-3.8-flash-thinking"], "extended thinking must exist");
+  assert.equal(MODELS["gemini-3.8-flash-thinking"].mode, 2);
+
+  // 旧名字保留为别名,不能因为改名就让调用方报错
+  for (const alias of ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]) {
+    const r = resolveModel(alias, "gemini-3.8-flash");
+    assert.equal(r.error, undefined, alias + " should still resolve");
+    assert.equal(r.modeId, 1, alias + " should map to FAST");
+  }
+  assert.equal(resolveModel("gemini-3.5-flash-thinking", "x").modeId, 2);
+  assert.equal(resolveModel("gemini-3.1-pro", "x").modeId, 3);
+  assert.equal(resolveModel("gemini-flash-lite", "x").modeId, 6);
+
+  // @think=N 覆盖仍然生效
+  assert.equal(resolveModel("gemini-3.8-flash@think=1", "x").thinkMode, 1);
 });
 
 test("getConfig keeps a single cookie containing | intact", () => {

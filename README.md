@@ -21,7 +21,7 @@
 - **R2 免费额度保护**: 单张体积上限 + 月度写入预算,超出后不再写 R2(图片仍能正常显示,只是不缓存);桶上配 7 天生命周期规则自动回收
 - **可切换出口池 + 纯净度排序**: 出口支持三种写法(`direct` / `colo:weur` Cloudflare 机房 / `socks5://`·`http://` 外部代理),每个出口实测打分后按分数择优使用,失败自动轮换。代理隧道建好后一律 `startTls` 到目标域名,不把 cookie 明文交给代理
 - **网页控制台**: `/ui`(根路径对浏览器自动返回它),含对话、会话管理、长期记忆、出口池测试与状态面板
-- **多模型**: `gemini-3.7-flash`、`gemini-3.6-flash`、3.5-flash、Thinking、Pro、Auto、Lite 等
+- **多模型**: `gemini-3.8-flash`(默认)、`gemini-3.8-flash-thinking`(扩展思考)、`gemini-3.1-pro`、`gemini-auto`、`gemini-flash-lite` 等;旧版本名(3.7/3.6/3.5)保留为指向 3.8 的别名
 - **思考深度**: 模型名加 `@think=N` 后缀调节
 - **多模态输入**: 支持 OpenAI `image_url` / `input_image` / Anthropic `image` 风格(base64 data: URL、URL-encoded data: URL、http(s) 链接);需配置 `GEMINI_COOKIE`,经 Scotty 续传上传到 Gemini
 - **图片 MIME 嗅探**: 按 magic bytes 修正 PNG/JPEG/GIF/WebP/BMP/TIFF/AVIF/HEIC,不信任声明的 content-type

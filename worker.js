@@ -81,7 +81,7 @@ const CONFIG = {
   TEMPORARY_CHATS: false,
   // 上游返回 405(常见于 BL 过期)时,自动抓取最新构建号并重试一次。
   AUTO_UPDATE_BL: true,
-  DEFAULT_MODEL: "gemini-3.6-flash",
+  DEFAULT_MODEL: "gemini-3.8-flash",
   RETRY_ATTEMPTS: 3,
   // BardErrorInfo[1060](出口 IP 风控)时的跨出口重试次数
   BARD_RETRY_ATTEMPTS: 8,
@@ -159,16 +159,24 @@ const CONFIG = {
 // ─── 模型 ────────────────────────────────────────────────────────────────
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
 //   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+//
+// 2026-09-25 实测:网页端的模式选择器为
+//   3.5 Flash-Lite / 3.8 Flash / 3.1 Pro / 扩展思考
+// 抓下网页真实 payload 后确认:网页端「3.8 Flash」用的就是 inner[79]=1,
+// 与本表 mode:1 一致 —— 即后端已经把这档升到 3.8,只是名字要跟着改。
+// 注意网页端 Flash 的 inner[17] 是 [[1]](我们用 [[4]]),见下方 THINK 说明。
 const MODELS = {
-  "gemini-3.7-flash": { mode: 1, think: 4, desc: "Latest all-around model (Gemini 3.7 Flash)" },
-  "gemini-3.6-flash": { mode: 1, think: 4, desc: "All-around model (Gemini 3.6 Flash)" },
-  "gemini-3.5-flash": { mode: 1, think: 4, desc: "Alias for gemini-3.6-flash (backend upgraded)" },
-  "gemini-3.5-flash-thinking": { mode: 2, think: 0, desc: "Deep thinking mode, longest output (~20k chars)" },
+  "gemini-3.8-flash": { mode: 1, think: 4, desc: "Latest all-around model (Gemini 3.8 Flash)" },
+  "gemini-3.7-flash": { mode: 1, think: 4, desc: "Alias for gemini-3.8-flash (backend upgraded)" },
+  "gemini-3.6-flash": { mode: 1, think: 4, desc: "Alias for gemini-3.8-flash (backend upgraded)" },
+  "gemini-3.5-flash": { mode: 1, think: 4, desc: "Alias for gemini-3.8-flash (backend upgraded)" },
+  "gemini-3.8-flash-thinking": { mode: 2, think: 0, desc: "Extended thinking mode, longest output (~20k chars)" },
+  "gemini-3.5-flash-thinking": { mode: 2, think: 0, desc: "Alias for gemini-3.8-flash-thinking" },
   "gemini-3.1-pro": { mode: 3, think: 4, desc: "Pro model (requires cookie for real routing)" },
   "gemini-3.1-pro-enhanced": { mode: 3, think: 4, extra: { 31: 2, 80: 3 }, desc: "Pro with enhanced output (experimental)" },
   "gemini-auto": { mode: 4, think: 4, desc: "Auto model selection" },
   "gemini-3.5-flash-thinking-lite": { mode: 5, think: 0, desc: "Dynamic thinking with adaptive depth" },
-  "gemini-flash-lite": { mode: 6, think: 4, desc: "Lightweight fast model" },
+  "gemini-flash-lite": { mode: 6, think: 4, desc: "3.5 Flash-Lite, fastest responses" },
 };
 /**
  * 把模型名解析成路由参数。
