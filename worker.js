@@ -481,8 +481,10 @@ async function buildHeaders(cfg) {
   if (cfg.web_parity !== false) {
     // 这几个头是 Web 端用来声明「客户端能力/模型配置」的,服务端据此选功能集。
     const guid = (cfg._req_uuid || uuid()).toUpperCase();
+    // 能力列表要跟真实网页一致:网页是 [4,5,6,8,16, 4,5,6,8,16],我们原来少了 16。
+    // 这个列表是客户端向服务端声明「我支持哪些能力」的,缺项会被当成能力不足。
     headers["x-goog-ext-525001261-jspb"] =
-      '[1,null,null,null,"56fdd199312815e2",null,null,0,[4,5,6,8,4,5,6,8],null,null,2,null,null,1,1,"' +
+      '[1,null,null,null,"56fdd199312815e2",null,null,0,[4,5,6,8,16,4,5,6,8,16],null,null,2,null,null,1,1,"' +
       guid + '",null,null,[[1,55200000],[' + nowSec() + "," + (Date.now() % 1000) * 1000000 + "]]]";
     headers["x-goog-ext-525005358-jspb"] = '["' + guid + '",1]';
     headers["x-goog-ext-73010989-jspb"] = "[0]";
