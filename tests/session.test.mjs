@@ -81,6 +81,52 @@ test("renderSlice renders only the messages from the given index", () => {
   assert.equal(renderSlice(messages, 0), "[System instruction]: sys\n\nu1\n\n[Assistant]: a1\n\nu2");
 });
 
+test("sessionKey recognises a Gemini conversation id and addresses it directly", () => {
+  const req = { headers: new Headers({ "x-session-id": "c_a0a619b3daaa3bf8" }) };
+  const k = sessionKey({}, req, {}, []);
+  assert.equal(k.explicit, true);
+  assert.equal(k.cid, "c_a0a619b3daaa3bf8");
+  assert.equal(k.raw, "cid:c_a0a619b3daaa3bf8");
+  // body 里的 session_id 同样支持
+  const viaBody = sessionKey({}, { headers: new Headers() }, { session_id: "c_0123456789abcdef" }, []);
+  assert.equal(viaBody.cid, "c_0123456789abcdef");
+  // 普通自定义 id 不能被误判成 cid
+  const plain = sessionKey({}, { headers: new Headers({ "x-session-id": "my-chat-1" }) }, {}, []);
+  assert.equal(plain.cid, undefined);
+});
+
+test("planTurn keeps a cid-addressed session even when local history diverged", () => {
+  // 客户端截断旧消息、或每轮都换 system prompt(时间戳之类)会让前缀对不上。
+  // 以前这种情况会退回「重发全量」,长对话发几轮就爆 —— 点名了 cid 就不该这样。
+  const cfg = { session_ttl_sec: 604800 };
+  const sess = sessionWith([{ role: "user", content: "u1" }]);
+  const messages = [
+    { role: "system", content: "当前时间 12:00:03" },
+    { role: "user", content: "被截断过的历史" },
+    { role: "user", content: "新问题" },
+  ];
+  assert.equal(planTurn(cfg, sess, messages, "1", false, false).mode, "new");
+  const plan = planTurn(cfg, sess, messages, "1", false, true);
+  assert.equal(plan.mode, "continue");
+  assert.equal(plan.reason, "trusted-last-user");
+  assert.equal(renderSlice(messages, plan.startIndex), "新问题");
+});
+
+test("planTurn trusts a cid session when the client sends only the new message", () => {
+  const cfg = { session_ttl_sec: 604800 };
+  const sess = sessionWith([{ role: "user", content: "u1" }, { role: "assistant", content: "a1" }]);
+  const plan = planTurn(cfg, sess, [{ role: "user", content: "只发这一条" }], "1", false, true);
+  assert.equal(plan.mode, "continue");
+  assert.equal(plan.startIndex, 0);
+});
+
+test("planTurn still refuses to invent a session when there is none", () => {
+  const cfg = { session_ttl_sec: 604800 };
+  const plan = planTurn(cfg, null, [{ role: "user", content: "hi" }], "1", false, true);
+  assert.equal(plan.mode, "new");
+  assert.equal(plan.reason, "no-session");
+});
+
 function sessionWith(messages, over = {}) {
   return {
     cid: "c_1",

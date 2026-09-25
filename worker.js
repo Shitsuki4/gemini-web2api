@@ -2216,8 +2216,11 @@ async function handleChat(req, cfg, request) {
   const turnHeaders = {
     "X-Gemini-Session": sctx.sid ? sctx.sid.slice(0, 12) : "",
     "X-Gemini-Session-Mode": `${sctx.plan.mode}:${sctx.plan.reason}`,
-    "Access-Control-Expose-Headers": "X-Gemini-Session, X-Gemini-Session-Mode, X-Gemini-Egress",
+    "Access-Control-Expose-Headers": "X-Gemini-Session, X-Gemini-Session-Mode, X-Gemini-Cid, X-Gemini-Egress",
   };
+  // Gemini 的会话 id(网页地址栏 /app/<cid> 里的那个)。只有生成完才知道新会话的 cid,
+  // 所以非流式在最后补进响应头,流式用 SSE 注释回传。
+  const cidHeaders = () => ({ "X-Gemini-Cid": (cfg._session_meta && cfg._session_meta[0]) || "" });
   const deltaImages = [];
   let promptBody = promptFull;
   let images = imagesFull;
@@ -2273,6 +2276,10 @@ async function handleChat(req, cfg, request) {
         }
         await finishTurn(got, acc);
         chunk({}, "stop");
+        // 流式响应头在开始时就固定了,新会话那时还没有 cid —— 用 SSE 注释回传。
+        // OpenAI 客户端会忽略 ':' 开头的行,不影响兼容性。
+        const cidOut = (cfg._session_meta && cfg._session_meta[0]) || "";
+        if (cidOut) write(": gemini-cid=" + cidOut + "\n\n");
         write("data: [DONE]\n\n");
       }
     }, turnHeaders);
@@ -2318,7 +2325,7 @@ async function handleChat(req, cfg, request) {
       completion_tokens: tokenEst(text),
       total_tokens: tokenEst(prompt) + tokenEst(text),
     },
-  }, 200, turnHeaders);
+  }, 200, { ...turnHeaders, ...cidHeaders() });
 }
 // 从请求头提取客户端 IP(Cloudflare 环境用 cf-connecting-ip)。
 function clientIp(request) {
@@ -2424,8 +2431,11 @@ async function handleResponses(req, cfg, request) {
   const turnHeaders = {
     "X-Gemini-Session": sctx.sid ? sctx.sid.slice(0, 12) : "",
     "X-Gemini-Session-Mode": `${sctx.plan.mode}:${sctx.plan.reason}`,
-    "Access-Control-Expose-Headers": "X-Gemini-Session, X-Gemini-Session-Mode, X-Gemini-Egress",
+    "Access-Control-Expose-Headers": "X-Gemini-Session, X-Gemini-Session-Mode, X-Gemini-Cid, X-Gemini-Egress",
   };
+  // Gemini 的会话 id(网页地址栏 /app/<cid> 里的那个)。只有生成完才知道新会话的 cid,
+  // 所以非流式在最后补进响应头,流式用 SSE 注释回传。
+  const cidHeaders = () => ({ "X-Gemini-Cid": (cfg._session_meta && cfg._session_meta[0]) || "" });
   const deltaImages = [];
   let promptBody = promptFull;
   let images = imagesFull;
@@ -2497,9 +2507,9 @@ async function handleResponses(req, cfg, request) {
         }
       });
       emit("response.completed", { response: { ...baseResponse, status: "completed", output, usage } });
-    });
+    }, { ...turnHeaders, ...cidHeaders() });
   }
-  return jsonResponse({ id: rid, object: "response", created_at: nowSec(), status: "completed", model: rm.name, output, usage });
+  return jsonResponse({ id: rid, object: "response", created_at: nowSec(), status: "completed", model: rm.name, output, usage }, 200, { ...turnHeaders, ...cidHeaders() });
 }
 // POST /v1beta/models/{model}:generateContent | :streamGenerateContent
 async function handleGoogleGenerate(req, cfg, path, stream, request) {
@@ -2869,14 +2879,35 @@ function firstUserText(messages) {
   }
   return "";
 }
+// Gemini 的会话 id(网页地址栏 /app/<cid> 里的那个),16 位十六进制。
+const GEMINI_CID_RE = /^c_[0-9a-f]{8,}$/i;
+/** 用 Gemini 会话 id 直接找会话 —— 客户端可以拿它当会话标识用。 */
+async function sessionGetByCid(env, cid) {
+  if (!env || !cid || !env.DB) return null;
+  try {
+    await ensureSchema(env);
+    return await env.DB.prepare(
+      "SELECT * FROM chat_sessions WHERE cid = ?1 ORDER BY updated_ts DESC LIMIT 1"
+    ).bind(cid).first() || null;
+  } catch (_) { return null; }
+}
 function sessionKey(cfg, request, req, messages) {
   let h = null;
   try { h = request && request.headers; } catch (_) { h = null; }
+  const explicit = (value, source) => {
+    const v = String(value || "").trim();
+    if (!v) return null;
+    // 直接给 Gemini 会话 id 时按 cid 找,这样「会话 = gemini.google.com/app/<cid>」是一一对应的
+    if (GEMINI_CID_RE.test(v)) return { raw: "cid:" + v, explicit: true, source, cid: v };
+    return { raw: "h:" + v, explicit: true, source };
+  };
   const hdr = (h && (h.get("x-session-id") || h.get("x-conversation-id") || h.get("x-chat-id"))) || "";
-  if (String(hdr).trim()) return { raw: "h:" + String(hdr).trim(), explicit: true, source: "header" };
+  const fromHdr = explicit(hdr, "header");
+  if (fromHdr) return fromHdr;
   for (const k of ["session_id", "conversation_id", "chat_id"]) {
-    if (req && typeof req[k] === "string" && req[k].trim()) {
-      return { raw: "h:" + req[k].trim(), explicit: true, source: k };
+    if (req && typeof req[k] === "string") {
+      const got = explicit(req[k], k);
+      if (got) return got;
     }
   }
   if (req && typeof req.user === "string" && req.user.trim()) {
@@ -2920,7 +2951,7 @@ function messageHash(messages, count) {
  *   mode="continue":只把 messages.slice(startIndex) 发上去,inner[2] 带会话 id
  *   mode="new"     :整段历史照发,开新会话
  */
-function planTurn(cfg, sess, messages, modelId, deltaOK) {
+function planTurn(cfg, sess, messages, modelId, deltaOK, trusted) {
   const out = { mode: "new", startIndex: 0, reason: "" };
   if (!sess || !sess.cid || !sess.rid) { out.reason = "no-session"; return out; }
   const ttlMs = Math.max(60, cfg.session_ttl_sec || 604800) * 1000;
@@ -2953,6 +2984,21 @@ function planTurn(cfg, sess, messages, modelId, deltaOK) {
     out.reason = "nothing-new";
     return out;
   }
+  // ③ 客户端点名了 Gemini 会话(c_…)但本地历史对不上 —— 常见于客户端截断旧消息、
+  //    每轮换 system prompt(时间戳之类)、或本来就只发新消息。会话主体在上游,
+  //    没理由因为本地前缀对不上就重发全量(那才是长对话发几条就爆的原因)。
+  //    只把最后一条用户消息发上去。
+  if (trusted) {
+    let j = messages.length - 1;
+    while (j >= 0 && (messages[j] || {}).role !== "user") j--;
+    if (j < 0) j = messages.length - 1;
+    if (j >= 0) {
+      out.mode = "continue";
+      out.startIndex = j;
+      out.reason = "trusted-last-user";
+      return out;
+    }
+  }
   out.reason = sent === 0 ? "no-prefix" : "history-diverged";
   return out;
 }
@@ -2967,13 +3013,23 @@ async function prepareSession(cfg, request, req, messages, modelId) {
   const key = sessionKey(cfg, request, req, messages);
   if (!key.raw) return Object.assign(off, { plan: { mode: "new", startIndex: 0, reason: "no-key" } });
   cfg._metaFresh = false;
-  const sid = syncHash(key.raw);
+  let sid;
   let sess = null;
-  try { sess = await sessionGet(env, sid); } catch (_) { sess = null; }
+  if (key.cid) {
+    // 客户端直接给了 Gemini 会话 id:按 cid 找(会话 = gemini.google.com/app/<cid>)
+    sess = await sessionGetByCid(env, key.cid);
+    sid = sess ? sess.sid : syncHash(key.raw);
+    if (!sess) log(cfg, `会话 ${key.cid} 本地没有记录(已过期或换了实例),按新会话处理`);
+  } else {
+    sid = syncHash(key.raw);
+    try { sess = await sessionGet(env, sid); } catch (_) { sess = null; }
+  }
   const deltaOK = key.explicit && deltaModeRequested(cfg, request, req);
-  const plan = planTurn(cfg, sess, messages, modelId, deltaOK);
+  // 点名了 Gemini 会话 => 以上游会话为准,前缀对不上也照样续(见 planTurn ③)
+  const trusted = !!key.cid;
+  const plan = planTurn(cfg, sess, messages, modelId, deltaOK, trusted);
   if (plan.mode === "continue" && sess) cfg._session_meta = [sess.cid, sess.rid, sess.rcid || ""];
-  return { sid, sess, explicit: key.explicit, source: key.source, model: modelId, plan, deltaOK };
+  return { sid, sess, explicit: key.explicit, source: key.source, cid: key.cid || "", model: modelId, plan, deltaOK };
 }
 
 /** 一轮结束后:落库会话 + 把本轮图片 URL→key 映射写进 D1。 */

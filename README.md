@@ -13,7 +13,10 @@
 - **工具调用**: Function Calling(OpenAI 格式);大工具列表自动裁剪参数防静默截断
 - **图片生成**: 输出图片链接,同时以 `message.images[]` 返回;流式同样支持
 - **图片自建中转**: 生成图链接改写成 `<PUBLIC_ORIGIN>/img/<key>`,由本 worker 回源并按 key 缓存(Cloudflare 边缘缓存 + R2)。不再把 `googleusercontent.com` 直链交给客户端 —— 那个域名部分地区被墙,且 `gg-dl` 是带签名会过期的下载链
-- **服务端会话续聊**: 把 Gemini 的会话标识(`cid`/`rid`/`rcid`)存进 D1,下一轮回填 `inner[2]` 并**只发新增内容**,历史留在 Gemini 侧(省 token、真记忆)。客户端照样发整段历史也能命中 —— 用「条数 + 渲染指纹」校验前缀,对不上就当新会话,不会串话;显式声明 `X-Session-Mode: delta` 时可只发增量
+- **服务端会话续聊(会话 = Gemini 会话 id)**: D1 `chat_sessions` 存着 Gemini 的会话标识(`cid`/`rid`/`rcid`),下一轮回填 `inner[2]`,**只把新增内容发上去**,历史留在 Gemini 侧
+  - 响应会回传真实 cid:非流式看响应头 `X-Gemini-Cid`,流式看 SSE 注释 `: gemini-cid=c_…`(OpenAI 客户端会忽略 `:` 开头的行)。把这个 cid 当会话 id 传回来(`X-Session-Id: c_…` 或 body 的 `session_id`),**下一轮只发那一条新消息即可,无需携带历史** —— 这时一个会话就等价于 `gemini.google.com/app/<cid>`
+  - **点名 cid 时以上游会话为准**:即使本地历史对不上(客户端截断了旧消息、每轮都换 system prompt 之类)也照样续,只发最后一条用户消息 —— 不会退回「重发全量」,长对话因此不会发几轮就爆
+  - 不给会话 id 时,按「API Key + 首条用户消息」隐式归组,并用「条数 + 渲染指纹」校验前缀;对不上就当新会话(保守,不串话)。`X-Session-Mode: delta` 可显式声明「我只发增量」
 - **跨会话长期记忆**: 事实存 D1,开新会话时注入 prompt;`/v1/memories` 增删查,`X-Memory-Scope` 做分组隔离,可选每轮自动提炼
 - **R2 免费额度保护**: 单张体积上限 + 月度写入预算,超出后不再写 R2(图片仍能正常显示,只是不缓存);桶上配 7 天生命周期规则自动回收
 - **可切换出口池 + 纯净度排序**: 出口支持三种写法(`direct` / `colo:weur` Cloudflare 机房 / `socks5://`·`http://` 外部代理),每个出口实测打分后按分数择优使用,失败自动轮换。代理隧道建好后一律 `startTls` 到目标域名,不把 cookie 明文交给代理
@@ -179,7 +182,7 @@ proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 ht
 - **上游风控**:Google 会按出口 IP 拒绝部分数据中心流量(`BardErrorInfo[1060]`)。在 Cloudflare 部署若遇此问题,把 `GEMINI_ORIGIN` 指向一个住宅/干净 IP 的反向代理,或依赖 `DO_EGRESS` 出口池换机房。
 - **图片生成受账号/出口限制**:上游可能直接回「Are you signed in? ... image creation isn't available in your location yet.」。这是 Gemini 侧对账号资格或出口 IP 的判断,与本仓库无关。已实测:七个 Cloudflare 机房**全部**被拒(见上一节),所以换机房没用 —— 需要接外部代理 IP,或用 `/admin/egress` 逐个试出一个能出图的出口。中转链路(`/img/<key>`)只负责转发与缓存,不解决这一点。
 - **会话绑在 Gemini 侧**:续聊依赖上游返回的 `cid`/`rid` 仍然有效;上游会话被清理或 cookie 换号后会退回新会话(不会报错)。
-- **隐式会话键可能撞车**:不显式给会话 id 时,键 = `API key + 首条用户消息`。若同时开着**两个第一句完全相同**的对话并交叉发消息,理论上会互相串上下文。多会话客户端请显式带 `X-Session-Id`(或 body 的 `session_id`)——单条消息的新请求永远不会误续,所以只影响"同开头 + 并发"这一种情况。
+- **隐式会话键可能撞车**:不给会话 id 时,键 = `API key + 首条用户消息`。若同时开着**两个第一句完全相同**的对话并交叉发消息,理论上会互相串上下文。用响应回传的 **cid 当会话 id** 可彻底避免;或显式带 `X-Session-Id`。单条消息的新请求永远不会误续,所以只影响「同开头 + 并发」这一种情况。
 - **`/img` 是公开端点**:靠不可猜的 key 当凭据(`<img>` 标签发不出 Authorization 头)。key 只由白名单内的 `googleusercontent.com` URL 生成,不构成任意 URL 代理;另有每 IP 限流。
 - **图片缓存 7 天后失效**:R2 生命周期到期删除后,若上游签名链也已过期,该图将无法再取回。
 - **图片需登录态**:未配置 `GEMINI_COOKIE` 时图片会被忽略并在 prompt 中提示。

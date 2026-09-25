@@ -121,7 +121,7 @@ export const UI_HTML = `<!doctype html>
       </div>
       <div class="hint" id="sessHint" style="margin:8px 0"></div>
       <div class="scroll"><table><thead><tr>
-        <th>会话</th><th>轮次</th><th>模型</th><th>模式</th><th>更新时间</th><th></th>
+        <th>Gemini 会话 (cid)</th><th>轮次</th><th>模型</th><th>模式</th><th>更新时间</th><th></th>
       </tr></thead><tbody id="sessBody"></tbody></table></div>
     </div>
   </section>
@@ -313,6 +313,12 @@ export const UI_HTML = `<!doctype html>
           var lines = buf.split("\\n");
           buf = lines.pop();
           lines.forEach(function (line) {
+            // 流式响应头一开始就固定了,新会话的 cid 只能靠 SSE 注释回传
+            if (line.indexOf(": gemini-cid=") === 0) {
+              var got = line.slice(13).trim();
+              if (got) { $("sid").value = got; addMsg("sys", "本会话 Gemini cid = " + got); }
+              return;
+            }
             if (line.indexOf("data: ") !== 0) return;
             var payload = line.slice(6);
             if (payload === "[DONE]") return;
@@ -362,17 +368,30 @@ export const UI_HTML = `<!doctype html>
       var tb = $("sessBody"); clear(tb);
       (d.data || []).forEach(function (s) {
         var tr = el("tr");
-        tr.appendChild(el("td", "mono", s.sid.slice(0, 12)));
+        var tdId = el("td");
+        var a = document.createElement("a");
+        a.href = "https://gemini.google.com/app/" + s.cid;
+        a.target = "_blank";
+        a.rel = "noreferrer";
+        a.className = "mono";
+        a.textContent = s.cid;
+        a.style.color = "var(--accent)";
+        tdId.appendChild(a);
+        var sub = el("div", "mono muted", s.sid.slice(0, 10));
+        sub.style.fontSize = "11px";
+        tdId.appendChild(sub);
+        tr.appendChild(tdId);
         tr.appendChild(el("td", null, String(s.turns)));
         tr.appendChild(el("td", "muted", s.model || "—"));
         tr.appendChild(el("td", null, s.delta_mode ? "增量" : "前缀"));
         tr.appendChild(el("td", "muted", fmtTime(s.updated_ts)));
         var td = el("td");
         var use = el("button", null, "使用");
+        use.title = "把这条 Gemini 会话当作会话 id 继续聊";
         use.onclick = function () {
-          $("sid").value = s.sid;
+          $("sid").value = s.cid;
           history = []; clear($("log"));
-          addMsg("sys", "已切到会话 " + s.sid.slice(0, 12));
+          addMsg("sys", "已切到 Gemini 会话 " + s.cid + "(拿这个 id 继续聊即可,不必重发历史)");
         };
         var del = el("button", "danger", "删除");
         del.onclick = function () {
