@@ -23,6 +23,12 @@ test("UI_HTML ships every console tab and wires the admin endpoints", () => {
   }
 });
 
+test("UI_HTML links into Gemini with the bare conversation id", () => {
+  // Gemini 的会话地址是 /app/<裸hex>;带上 c_ 前缀会被弹回新会话页
+  assert.ok(UI_HTML.includes('replace(/^c_/, "")'), "session link must strip the c_ prefix");
+  assert.ok(UI_HTML.includes("https://gemini.google.com/app/"), "session link should point at Gemini");
+});
+
 test("UI_HTML escapes its script block correctly", () => {
   // 模板字符串里的 \\n 求值后是「一个反斜杠 + n」,浏览器侧正好是换行转义。
   // 这里锁住它,免得以后有人把转义改坏、导致 SSE 逐行解析静默失效。

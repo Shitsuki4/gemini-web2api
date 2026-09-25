@@ -369,8 +369,11 @@ export const UI_HTML = `<!doctype html>
       (d.data || []).forEach(function (s) {
         var tr = el("tr");
         var tdId = el("td");
+        // 注意:Gemini 网页地址用的是去掉 c_ 前缀的裸 hex(/app/a0a619b3daaa3bf8),
+        // 直接拼 c_… 会被网站弹回新会话页。给 API 用的仍是带前缀的 cid。
+        var bare = String(s.cid || "").replace(/^c_/, "");
         var a = document.createElement("a");
-        a.href = "https://gemini.google.com/app/" + s.cid;
+        a.href = "https://gemini.google.com/app/" + bare;
         a.target = "_blank";
         a.rel = "noreferrer";
         a.className = "mono";
