@@ -38,6 +38,9 @@
  * 1100 拒绝),并在 prompt 里加一句提示。`gemini-3.1-pro` 也只有带付费账号 cookie
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
+// 控制台前端(单页)。放在独立文件里便于维护,wrangler 会把它打包进来。
+import { UI_HTML } from "./ui.js";
+
 const VERSION = "2.0.0-worker";
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -136,6 +139,17 @@ const CONFIG = {
   // 图片缓存时间(秒),与 R2 的 7 天生命周期规则对齐。
   IMAGE_CACHE_TTL_SEC: 604800,
   IMAGE_PROXY_RATE_MAX: 600,
+  // ── 出口池(换掉 Google 看到的 IP)──────────────────────────────────────
+  // 逗号分隔,三种写法混用:
+  //   colo:weur                              Cloudflare 机房(经 EgressRelay DO)
+  //   proxy:socks5://user:pass@1.2.3.4:1080  外部代理(也支持 http:// / https://)
+  //   direct                                 直接用 Worker 自带出口
+  // 留空则沿用 EGRESS_HINT / EGRESS_FALLBACK_HINTS。运行时可经 /admin/egress 热改(存 KV)。
+  EGRESS_POOL: "",
+  // 强制使用某个出口(id 如 proxy:ab12cd34ef56 或 colo:weur);空 = 按纯净度评分自动择优
+  EGRESS_FORCE: "",
+  // 纯净度探测是否顺带测「图片生成能不能出图」(图片才是真正卡人的指标,但会真的调一次生成)
+  EGRESS_PROBE_IMAGE: true,
 };
 // ─── 模型 ────────────────────────────────────────────────────────────────
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
@@ -278,6 +292,9 @@ function getConfig(env) {
     image_object_max_bytes: Math.max(1024, parseIntDefault(envOr(env, "IMAGE_OBJECT_MAX_BYTES", CONFIG.IMAGE_OBJECT_MAX_BYTES), 12582912)),
     image_cache_ttl_sec: Math.max(60, parseIntDefault(envOr(env, "IMAGE_CACHE_TTL_SEC", CONFIG.IMAGE_CACHE_TTL_SEC), 604800)),
     image_proxy_rate_max: Math.max(1, parseIntDefault(envOr(env, "IMAGE_PROXY_RATE_MAX", CONFIG.IMAGE_PROXY_RATE_MAX), 600)),
+    egress_pool: String(envOr(env, "EGRESS_POOL", CONFIG.EGRESS_POOL) || ""),
+    egress_force: String(envOr(env, "EGRESS_FORCE", CONFIG.EGRESS_FORCE) || "").trim(),
+    egress_probe_image: parseBool(envOr(env, "EGRESS_PROBE_IMAGE", CONFIG.EGRESS_PROBE_IMAGE), true),
     _env: env,
     _ctx: null,
     _cookieSource: cookieEntries.length > 1 ? "env-pool" : (env.GEMINI_COOKIE || env.GEMINI_COOKIES || env.COOKIE_STRING ? "env" : (CONFIG.GEMINI_COOKIE ? "builtin" : "none")),
@@ -516,6 +533,12 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
   const secure = u.protocol !== "http:";
   const port = u.port ? Number(u.port) : (secure ? 443 : 80);
   const socket = connect({ hostname: u.hostname, port }, { secureTransport: secure ? "on" : "off", allowHalfOpen: false });
+  return httpOverSocket(socket, url, { method, headers, body, timeoutMs });
+}
+// 在「已建立好的」socket 上跑一次 HTTP/1.1 往返。抽出来是为了让代理隧道
+// (CONNECT / SOCKS5 之后再 startTls)复用同一套收发与分块解码逻辑。
+async function httpOverSocket(socket, url, { method = "GET", headers = {}, body, timeoutMs = 180000 } = {}) {
+  const u = new URL(url);
   let timer = null;
   if (timeoutMs) timer = setTimeout(() => { try { socket.close(); } catch (_) {} }, timeoutMs);
   const enc = new TextEncoder();
@@ -604,14 +627,417 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
   };
   return res;
 }
+// ─── 出口隧道(经外部代理换掉 Google 看到的 IP)─────────────────────────────
+// 两种代理都支持,且隧道建好后一律 startTls() 到目标域名 —— 全程加密,
+// 不会把 Gemini 的 cookie 明文交给代理。
+/** 给 socket 的 readable 套一层缓冲,支持「按需精确读 n 字节」。
+ *  真实 socket 一次 read 可能返回比需要的更多字节,所以必须缓冲而不是丢弃。 */
+function streamSource(reader) {
+  let buf = new Uint8Array(0);
+  return {
+    async need(n) {
+      while (buf.length < n) {
+        const { done, value } = await reader.read();
+        if (done) throw new Error("proxy: socket closed mid-handshake");
+        buf = _concatBytes(buf, value);
+      }
+      const out = buf.slice(0, n);
+      buf = buf.slice(n);
+      return out;
+    },
+    leftover() { return buf; },
+  };
+}
+/** 读 HTTP 响应头直到空行(逐字节,CONNECT 响应只有几十字节)。 */
+async function readHttpHead(src) {
+  let text = "";
+  for (let i = 0; i < 8192; i++) {
+    text += String.fromCharCode((await src.need(1))[0]);
+    if (text.endsWith("\r\n\r\n")) return text.slice(0, -4);
+  }
+  throw new Error("proxy: no CONNECT response");
+}
+/** SOCKS5 握手 + CONNECT(用户名/密码认证按需,支持域名地址)。 */
+async function socks5Connect(writer, src, host, port, user, pass) {
+  const enc = new TextEncoder();
+  const wantAuth = !!(user || pass);
+  await writer.write(new Uint8Array(wantAuth ? [5, 2, 0, 2] : [5, 1, 0]));
+  const greeting = await src.need(2);
+  if (greeting[0] !== 5) throw new Error("socks5: bad version reply");
+  if (greeting[1] === 2) {
+    const ub = enc.encode(user || "");
+    const pb = enc.encode(pass || "");
+    const msg = new Uint8Array(3 + ub.length + pb.length);
+    let o = 0;
+    msg[o++] = 1; msg[o++] = ub.length; msg.set(ub, o); o += ub.length;
+    msg[o++] = pb.length; msg.set(pb, o);
+    await writer.write(msg);
+    const auth = await src.need(2);
+    if (auth[1] !== 0) throw new Error("socks5: auth rejected");
+  } else if (greeting[1] !== 0) {
+    throw new Error("socks5: no acceptable auth method");
+  }
+  const hb = enc.encode(host);
+  const req = new Uint8Array(7 + hb.length);
+  let i = 0;
+  req[i++] = 5; req[i++] = 1; req[i++] = 0; req[i++] = 3; req[i++] = hb.length;
+  req.set(hb, i); i += hb.length;
+  req[i++] = (port >> 8) & 0xff; req[i++] = port & 0xff;
+  await writer.write(req);
+  const rep = await src.need(4);
+  if (rep[1] !== 0) throw new Error("socks5: connect failed (code " + rep[1] + ")");
+  let skip = 0;
+  if (rep[3] === 1) skip = 6;
+  else if (rep[3] === 4) skip = 18;
+  else if (rep[3] === 3) skip = (await src.need(1))[0] + 2;
+  if (skip) await src.need(skip);
+}
+/**
+ * 经代理发一次请求。http(s):// 走 CONNECT 隧道,socks5(h):// 走 SOCKS5。
+ * 两者都在隧道建立后 startTls 到目标域名,再复用 httpOverSocket 的收发逻辑。
+ */
+async function proxyHttpFetch(cfg, entry, url, opts) {
+  const connect = await resolveConnect();
+  if (!connect) throw new Error("proxy egress requires cloudflare:sockets (unavailable in this runtime)");
+  const p = entry.proxy || (parseEgressSpec(entry.target) || {}).proxy;
+  if (!p) throw new Error("proxy egress: bad spec");
+  const u = new URL(url);
+  const secure = u.protocol !== "http:";
+  const targetPort = u.port ? Number(u.port) : (secure ? 443 : 80);
+  const socket = connect(
+    { hostname: p.host, port: p.port },
+    { secureTransport: p.scheme === "https" ? "on" : "off", allowHalfOpen: false }
+  );
+  let writer = null;
+  let reader = null;
+  try {
+    writer = socket.writable.getWriter();
+    reader = socket.readable.getReader();
+    const src = streamSource(reader);
+    if (p.scheme === "http" || p.scheme === "https") {
+      let head = `CONNECT ${u.hostname}:${targetPort} HTTP/1.1\r\nHost: ${u.hostname}:${targetPort}\r\n`;
+      if (p.user || p.pass) {
+        head += "Proxy-Authorization: Basic " + bytesToBase64(new TextEncoder().encode(p.user + ":" + p.pass)) + "\r\n";
+      }
+      head += "\r\n";
+      await writer.write(new TextEncoder().encode(head));
+      const statusLine = (await readHttpHead(src)).split("\r\n")[0] || "";
+      if (!/^HTTP\/1\.[01] 2\d\d/.test(statusLine)) throw new Error("proxy CONNECT refused: " + statusLine.trim());
+    } else {
+      await socks5Connect(writer, src, u.hostname, targetPort, p.user, p.pass);
+    }
+    reader.releaseLock();
+    writer.releaseLock();
+    reader = null;
+    writer = null;
+    let finalSocket = socket;
+    if (secure) {
+      if (typeof socket.startTls !== "function") throw new Error("socket.startTls unavailable: cannot TLS over proxy");
+      finalSocket = socket.startTls({ expectedServerHostname: u.hostname });
+    }
+    return await httpOverSocket(finalSocket, url, opts);
+  } catch (e) {
+    try { if (reader) reader.releaseLock(); } catch (_) {}
+    try { if (writer) writer.releaseLock(); } catch (_) {}
+    try { socket.close(); } catch (_) {}
+    throw e;
+  }
+}
+
+// ─── 出口池 ─────────────────────────────────────────────────────────────────
+// 出口有三种,统一成同一套「打分 + 排序 + 择优」:
+//   direct        直接用 Worker 自带出口
+//   colo:<hint>   经 EgressRelay Durable Object,落在指定 Cloudflare 机房
+//   proxy:<url>   经外部代理(http/https/socks5),真正换掉 Google 看到的 IP
+const EGRESS_PROXY_RE = /^(https?|socks5h?):\/\/(?:([^:@/]+):([^@/]*)@)?([^:/@\s]+):(\d+)$/i;
+/** 解析一条出口规格;无法识别返回 null。 */
+function parseEgressSpec(spec) {
+  const s = String(spec || "").trim();
+  if (!s) return null;
+  if (s.toLowerCase() === "direct") return { id: "direct", kind: "direct", target: "", label: "direct" };
+  const m = /^colo:([a-z]{2,4})$/i.exec(s);
+  if (m) {
+    const hint = m[1].toLowerCase();
+    if (!EGRESS_HINTS.has(hint)) return null;
+    return { id: "colo:" + hint, kind: "colo", target: hint, label: hint.toUpperCase() };
+  }
+  const p = EGRESS_PROXY_RE.exec(s);
+  if (p) {
+    const scheme = p[1].toLowerCase();
+    const user = p[2] ? decodeURIComponent(p[2]) : "";
+    const pass = p[3] != null && p[3] !== "" ? decodeURIComponent(p[3]) : "";
+    const host = p[4];
+    const port = Number(p[5]);
+    const target = `${scheme}://${user ? encodeURIComponent(user) + ":" + encodeURIComponent(pass) + "@" : ""}${host}:${port}`;
+    return {
+      id: "proxy:" + syncHash(target).slice(0, 12),
+      kind: "proxy",
+      target,
+      label: `${scheme}://${host}:${port}`,
+      proxy: { scheme, host, port, user, pass },
+    };
+  }
+  return null;
+}
+/** 默认出口池:沿用 EGRESS_HINT / EGRESS_FALLBACK_HINTS 配的机房。 */
+function defaultEgressPool(cfg) {
+  const hints = [cfg.egress_hint, ...(cfg.egress_fallback_hints || [])]
+    .map((x) => String(x || "").trim()).filter(Boolean);
+  return [...new Set(hints)].map((h) => parseEgressSpec("colo:" + h)).filter(Boolean);
+}
+/** 出口条目 → 规格字符串(存 D1 / 回显给前端都用它,保证往返一致)。 */
+function entryToSpec(e) {
+  if (!e) return "";
+  if (e.kind === "direct") return "direct";
+  if (e.kind === "colo") return "colo:" + (e.target || "");
+  return e.target || "";
+}
+/** 出口池:优先用 D1 里存的那份(可在前端热改),没有就用配置默认值。 */
+async function loadEgressPool(cfg, env) {
+  if (env && env.DB) {
+    try {
+      await ensureSchema(env);
+      const r = await env.DB.prepare("SELECT id, kind, target, label FROM egress_pool ORDER BY ord").all();
+      const rows = (r && r.results) || [];
+      const out = rows.map((x) => parseEgressSpec(entryToSpec(x))).filter(Boolean);
+      if (out.length) return out;
+    } catch (_) { /* 退回配置默认 */ }
+  }
+  return defaultEgressPool(cfg);
+}
+async function saveEgressPool(env, specs) {
+  if (!env || !env.DB) return false;
+  const parsed = (specs || [])
+    .map((s) => parseEgressSpec(typeof s === "string" ? s : (s && s.target) || ""))
+    .filter(Boolean);
+  try {
+    await ensureSchema(env);
+    const stmts = [env.DB.prepare("DELETE FROM egress_pool")];
+    parsed.forEach((e, i) => {
+      stmts.push(env.DB.prepare(
+        "INSERT INTO egress_pool (id, kind, target, label, ord) VALUES (?1,?2,?3,?4,?5)"
+      ).bind(e.id, e.kind, e.target || "", e.label || e.id, i));
+    });
+    await env.DB.batch(stmts);
+    return parsed;
+  } catch (_) { return false; }
+}
+/** 出口相关设置(强制出口 / 图片探针开关)。存 D1 是为了写完立刻能读到。 */
+async function loadEgressSettings(env) {
+  const out = {};
+  if (!env || !env.DB) return out;
+  try {
+    await ensureSchema(env);
+    const r = await env.DB.prepare("SELECT k, v FROM egress_settings").all();
+    for (const row of (r && r.results) || []) out[row.k] = row.v;
+  } catch (_) { /* ignore */ }
+  return out;
+}
+async function saveEgressSetting(env, k, v) {
+  if (!env || !env.DB) return false;
+  try {
+    await ensureSchema(env);
+    if (v === "" || v == null) {
+      await env.DB.prepare("DELETE FROM egress_settings WHERE k = ?1").bind(k).run();
+    } else {
+      await env.DB.prepare(
+        "INSERT INTO egress_settings (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+      ).bind(k, String(v)).run();
+    }
+    return true;
+  } catch (_) { return false; }
+}
+
+// ── 纯净度评分 ──────────────────────────────────────────────────────────────
+// 分数只反映「这个出口对 Gemini 有多干净」,不看带宽。基准:
+//   文本通 40 / 通但空 10 / 429(能连上、只是被限流)4 / 5xx 2 / 1060 或超时 0
+//   图片能出图再 +50 —— 图片才是真正卡人的指标
+//   拿到过响应再按延迟加 0~10 分
+const TEXT_SCORE = { ok: 40, empty: 10, "429": 4, http500: 2, http502: 2, http503: 2, html: 0, timeout: 0, error: 0, "1060": 0 };
+function scoreEgress(row) {
+  if (!row) return 0;
+  let s = TEXT_SCORE[row.text_status] != null ? TEXT_SCORE[row.text_status] : (row.text_status ? 1 : 0);
+  if (row.image_status === "ok") s += 50;
+  const lat = Number(row.latency_ms || 0);
+  if (lat > 0) s += Math.max(0, 10 - Math.min(10, lat / 1200));
+  return Math.max(0, Math.min(100, Math.round(s)));
+}
+async function egressStatsAll(env) {
+  const out = new Map();
+  if (!env || !env.DB) return out;
+  try {
+    await ensureSchema(env);
+    const r = await env.DB.prepare("SELECT * FROM egress_stats").all();
+    for (const row of (r && r.results) || []) out.set(row.id, row);
+  } catch (_) { /* ignore */ }
+  return out;
+}
+async function egressStatPut(env, entry, patch) {
+  if (!env || !env.DB) return null;
+  try {
+    await ensureSchema(env);
+    const prev = await env.DB.prepare("SELECT * FROM egress_stats WHERE id = ?1").bind(entry.id).first();
+    const row = Object.assign(
+      { runs: 0, ok_runs: 0, image_ok_runs: 0, fails: 0, latency_ms: 0, text_status: "", image_status: "" },
+      prev || {}, patch || {}
+    );
+    row.kind = entry.kind;
+    row.target = entry.target || "";
+    row.label = entry.label || entry.id;
+    row.runs = Number(row.runs || 0);
+    row.score = scoreEgress(row);
+    row.updated_ts = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO egress_stats (id, kind, target, label, text_status, image_status, latency_ms, runs, ok_runs, " +
+      "image_ok_runs, fails, score, detail, updated_ts) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) " +
+      "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, target=excluded.target, label=excluded.label, " +
+      "text_status=excluded.text_status, image_status=excluded.image_status, latency_ms=excluded.latency_ms, " +
+      "runs=excluded.runs, ok_runs=excluded.ok_runs, image_ok_runs=excluded.image_ok_runs, fails=excluded.fails, " +
+      "score=excluded.score, detail=excluded.detail, updated_ts=excluded.updated_ts"
+    ).bind(
+      entry.id, row.kind, row.target, row.label, row.text_status || "", row.image_status || "",
+      Number(row.latency_ms || 0) | 0, row.runs | 0, Number(row.ok_runs || 0) | 0,
+      Number(row.image_ok_runs || 0) | 0, Number(row.fails || 0) | 0, row.score,
+      row.detail == null ? null : String(row.detail).slice(0, 400), row.updated_ts
+    ).run();
+    return row;
+  } catch (e) {
+    log({ log_requests: true }, `egress 统计写入失败: ${e}`);
+    return null;
+  }
+}
+/** 出口按分数从高到低排序;强制指定的出口排最前。 */
+function orderEgress(pool, stats, force) {
+  const forced = force ? String(force) : "";
+  const withScore = pool.map((e, i) => ({ e, i, score: (stats.get(e.id) || {}).score || 0 }));
+  withScore.sort((a, b) => (b.score - a.score) || (a.i - b.i));
+  if (!forced) return withScore.map((x) => x.e);
+  const idx = withScore.findIndex((x) => x.e.id === forced || x.e.target === forced);
+  if (idx <= 0) return withScore.map((x) => x.e);
+  const arr = withScore.map((x) => x.e);
+  const [pick] = arr.splice(idx, 1);
+  return [pick, ...arr];
+}
+
+/** 一次纯净度探测:先文本探针,再(可选)图片探针 —— 图片才是真正卡人的指标。 */
+async function probeEgress(cfg, env, entry, opts) {
+  const probeCfg = Object.assign({}, cfg, {
+    _env: env, _egress: entry, do_egress: false, alt_transport: false,
+    fingerprint_jitter_ms: 0, retry_attempts: 1, log_requests: false,
+  });
+  const m = resolveModel("gemini-flash-lite", cfg.default_model);
+  let textStatus = "error";
+  let latency = 0;
+  let detail = "";
+  try {
+    const body = buildPayload("Reply with exactly one word: PONG", m.modeId, m.thinkMode, null, m.extra, probeCfg);
+    const headers = await buildHeaders(probeCfg);
+    const t0 = Date.now();
+    const resp = await httpFetch(getUrl(probeCfg), { method: "POST", headers, body, timeoutMs: 60000, socket: true, cfg: probeCfg });
+    const raw = await resp.text();
+    latency = Date.now() - t0;
+    const bard = /BardErrorInfo[^0-9]{0,20}(\d{3,5})/.exec(raw);
+    if (bard) textStatus = bard[1];
+    else if (resp.status === 429 || /recaptcha|unusual traffic/i.test(raw)) textStatus = "429";
+    else if (!resp.ok) textStatus = "http" + resp.status;
+    else if (/<!doctype html|sorry\/index/i.test(raw)) textStatus = "html";
+    else textStatus = extractResponseText(raw, null) ? "ok" : "empty";
+  } catch (e) {
+    textStatus = /timeout|abort/i.test(String((e && e.message) || e)) ? "timeout" : "error";
+    detail = String((e && e.message) || e).slice(0, 200);
+  }
+  let imageStatus = "skipped";
+  if (opts && opts.image) {
+    try {
+      const ibody = buildPayload("Generate a small image of a red apple.", m.modeId, m.thinkMode, null, m.extra, probeCfg);
+      const iheaders = await buildHeaders(probeCfg);
+      const iresp = await httpFetch(getUrl(probeCfg), { method: "POST", headers: iheaders, body: ibody, timeoutMs: 90000, socket: true, cfg: probeCfg });
+      const iraw = await iresp.text();
+      if (/BardErrorInfo[^0-9]{0,20}(\d{3,5})/.test(iraw) || !iresp.ok) imageStatus = "error";
+      else if (IMAGE_REGION_RE.test(iraw)) imageStatus = "blocked";
+      else {
+        const imgs = [];
+        for (const line of iraw.split("\n")) {
+          for (const im of extractPartsFromLine(line).images) {
+            if (!imgs.some((x) => x.url === im.url)) imgs.push(im);
+          }
+        }
+        imageStatus = imgs.length ? "ok" : "blocked";
+      }
+    } catch (_) {
+      imageStatus = "error";
+    }
+  }
+  const prev = (await egressStatsAll(env)).get(entry.id) || {};
+  return egressStatPut(env, entry, {
+    text_status: textStatus,
+    image_status: imageStatus,
+    latency_ms: latency,
+    detail,
+    runs: Number(prev.runs || 0) + 1,
+    ok_runs: Number(prev.ok_runs || 0) + (textStatus === "ok" ? 1 : 0),
+    image_ok_runs: Number(prev.image_ok_runs || 0) + (imageStatus === "ok" ? 1 : 0),
+    fails: Number(prev.fails || 0) + (textStatus === "ok" ? 0 : 1),
+  });
+}
+/** 跑一轮出口纯净度测试,返回排序后的结果。 */
+async function runEgressTests(cfg, env, ids, opts) {
+  const pool = await loadEgressPool(cfg, env);
+  const want = Array.isArray(ids) && ids.length ? pool.filter((e) => ids.includes(e.id)) : pool;
+  const results = [];
+  for (const entry of want) {
+    try {
+      results.push(await probeEgress(cfg, env, entry, opts));
+    } catch (e) {
+      results.push({ id: entry.id, label: entry.label, error: String((e && e.message) || e) });
+    }
+  }
+  return results;
+}
+
+/** 出口排序结果按 isolate 缓存 60s,避免每个请求都多一次 D1 读。 */
+let _egressCache = { data: null, ts: 0 };
+async function egressOrderCached(cfg, env) {
+  const now = Date.now();
+  if (_egressCache.data && now - _egressCache.ts < 60000) return _egressCache.data;
+  const pool = await loadEgressPool(cfg, env);
+  if (!pool.length) { _egressCache = { data: [], ts: now }; return []; }
+  const [stats, settings] = await Promise.all([egressStatsAll(env), loadEgressSettings(env)]);
+  const force = settings.force || cfg.egress_force || "";
+  cfg._egressForce = force;
+  if (settings.probe_image !== undefined) cfg.egress_probe_image = settings.probe_image === "1";
+  const order = orderEgress(pool, stats, force);
+  _egressCache = { data: order, ts: now };
+  return order;
+}
+/** 第 attempt 次尝试用池里第几个出口(按分数排序后轮换)。 */
+function applyEgressAttempt(cfg, attempt) {
+  const order = cfg && cfg._egressOrder;
+  if (!order || !order.length) return;
+  const e = order[attempt % order.length];
+  cfg._egress = e;
+  if (e.kind === "colo" && e.target) cfg._egressHint = e.target;
+}
+
 // 统一上游入口:socket 优先,失败/不可用则回退 fetch。返回类 Response 对象。
 // roundRobin>1 时:每次请求在多个 socket 连接间轮换,利用 CF 出口 IP 池
 // (不同 TCP 连接常落到不同出口),降低被 Google 单点风控(1060)的概率。
 async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true, redirect, cfg } = {}) {
-  // Prefer a regional Durable Object for Gemini origin calls. The ordinary
-  // Worker egress can land in Hong Kong, where image creation is unavailable;
-  // the DO locationHint gives us a stable European/US exit.
-  if (cfg && cfg.do_egress !== false && cfg._env && cfg._env.EGRESS && isGeminiOrigin(url, cfg)) {
+  const gemini = isGeminiOrigin(url, cfg);
+  // ① 显式指定的出口优先(出口池调度、纯净度探测都从这条路走)
+  if (cfg && cfg._egress && gemini) {
+    const e = cfg._egress;
+    if (e.kind === "proxy") {
+      return await proxyHttpFetch(cfg, e, url, { method, headers, body, timeoutMs });
+    }
+    if (e.kind === "colo" && cfg._env && cfg._env.EGRESS) {
+      const relayed = await doEgressFetch(cfg, url, { method, headers, body, redirect }, [e.target]);
+      if (relayed) return relayed;
+    }
+    // direct:落到下面的普通路径
+  }
+  // ② 老行为:优先走区域 Durable Object(Gemini 源站调用)
+  if (cfg && cfg.do_egress !== false && cfg._env && cfg._env.EGRESS && gemini) {
     try {
       const relayed = await doEgressFetch(cfg, url, { method, headers, body, redirect });
       if (relayed) return relayed;
@@ -1249,6 +1675,7 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
   let lastErr;
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
+      applyEgressAttempt(cfg, attempt);
       await applyFingerprintJitter(cfg);
       if (cfg.client_ip) log(cfg, `client_ip=${cfg.client_ip} model generate request`);
       let resp = await httpFetch(getUrl(cfg), {
@@ -1315,6 +1742,7 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
   };
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
+      applyEgressAttempt(cfg, attempt);
       await applyFingerprintJitter(cfg);
       let resp = await httpFetch(getUrl(cfg), {
         method: "POST",
@@ -1672,6 +2100,15 @@ function jsonResponse(data, status = 200, extra = {}) {
     headers: { "Content-Type": "application/json", ...corsHeaders(), ...extra },
   });
 }
+function uiResponse() {
+  return new Response(UI_HTML, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Robots-Tag": "noindex",
+    },
+  });
+}
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -1698,7 +2135,7 @@ function authorized(request, url, cfg) {
  * 构造一个 SSE 响应,响应体由 `producer(write)` 生成。
  * `write(str)` 会入队一个 UTF-8 分块。producer 结束后流会自动关闭。
  */
-function sseResponse(producer) {
+function sseResponse(producer, extra) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
@@ -1723,6 +2160,7 @@ function sseResponse(producer) {
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
       ...corsHeaders(),
+      ...(extra || {}),
     },
   });
 }
@@ -1747,6 +2185,13 @@ async function handleChat(req, cfg, request) {
   // 会话:命中续聊时只把新增内容发上去(历史留在 Gemini 侧)
   const sctx = await prepareSession(cfg, request, req, messages, rm.modeId);
   const cont = sctx.plan.mode === "continue";
+  // 把本轮会话状态回给调用方(前端要显示「这轮是续聊还是新开」)。走响应头而不是
+  // body,免得污染 OpenAI 兼容格式;用 curl -i 也能直接看到。
+  const turnHeaders = {
+    "X-Gemini-Session": sctx.sid ? sctx.sid.slice(0, 12) : "",
+    "X-Gemini-Session-Mode": `${sctx.plan.mode}:${sctx.plan.reason}`,
+    "Access-Control-Expose-Headers": "X-Gemini-Session, X-Gemini-Session-Mode, X-Gemini-Egress",
+  };
   const deltaImages = [];
   let promptBody = promptFull;
   let images = imagesFull;
@@ -1804,7 +2249,7 @@ async function handleChat(req, cfg, request) {
         chunk({}, "stop");
         write("data: [DONE]\n\n");
       }
-    });
+    }, turnHeaders);
   }
   let text;
   try {
@@ -1837,7 +2282,7 @@ async function handleChat(req, cfg, request) {
         choices: [{ index: 0, delta: msg, finish_reason: finish }],
       })}\n\n`);
       write("data: [DONE]\n\n");
-    });
+    }, turnHeaders);
   }
   return jsonResponse({
     id: cid, object: "chat.completion", created: nowSec(), model: rm.name,
@@ -1847,7 +2292,7 @@ async function handleChat(req, cfg, request) {
       completion_tokens: tokenEst(text),
       total_tokens: tokenEst(prompt) + tokenEst(text),
     },
-  });
+  }, 200, turnHeaders);
 }
 // 从请求头提取客户端 IP(Cloudflare 环境用 cf-connecting-ip)。
 function clientIp(request) {
@@ -1948,6 +2393,13 @@ async function handleResponses(req, cfg, request) {
   // 与 /v1/chat/completions 同一套会话/记忆逻辑
   const sctx = await prepareSession(cfg, request, req, messages, rm.modeId);
   const cont = sctx.plan.mode === "continue";
+  // 把本轮会话状态回给调用方(前端要显示「这轮是续聊还是新开」)。走响应头而不是
+  // body,免得污染 OpenAI 兼容格式;用 curl -i 也能直接看到。
+  const turnHeaders = {
+    "X-Gemini-Session": sctx.sid ? sctx.sid.slice(0, 12) : "",
+    "X-Gemini-Session-Mode": `${sctx.plan.mode}:${sctx.plan.reason}`,
+    "Access-Control-Expose-Headers": "X-Gemini-Session, X-Gemini-Session-Mode, X-Gemini-Egress",
+  };
   const deltaImages = [];
   let promptBody = promptFull;
   let images = imagesFull;
@@ -2307,6 +2759,12 @@ const DDL = [
   "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, updated_ts)",
   "CREATE TABLE IF NOT EXISTS img_map (hash TEXT PRIMARY KEY, url TEXT NOT NULL, ts INTEGER)",
   "CREATE TABLE IF NOT EXISTS img_budget (k TEXT PRIMARY KEY, v INTEGER DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS egress_stats (id TEXT PRIMARY KEY, kind TEXT, target TEXT, label TEXT, " +
+    "text_status TEXT, image_status TEXT, latency_ms INTEGER, runs INTEGER DEFAULT 0, ok_runs INTEGER DEFAULT 0, " +
+    "image_ok_runs INTEGER DEFAULT 0, fails INTEGER DEFAULT 0, score REAL DEFAULT 0, detail TEXT, updated_ts INTEGER)",
+  // 出口池存 D1 而不是 KV:KV 是最终一致的,写完立刻读会读不到,前端会以为没保存上。
+  "CREATE TABLE IF NOT EXISTS egress_pool (id TEXT PRIMARY KEY, kind TEXT, target TEXT, label TEXT, ord INTEGER)",
+  "CREATE TABLE IF NOT EXISTS egress_settings (k TEXT PRIMARY KEY, v TEXT)",
 ];
 let _schemaReady = false;
 let _schemaPromise = null;
@@ -2815,10 +3273,10 @@ function isGeminiOrigin(url, cfg) {
     return target.hostname === origin.hostname || target.hostname.endsWith(".gemini.google.com");
   } catch (_) { return false; }
 }
-async function doEgressFetch(cfg, url, init) {
+async function doEgressFetch(cfg, url, init, hintsOverride) {
   const env = cfg && cfg._env;
   if (!env || !env.EGRESS) return null;
-  const hints = egressHints(cfg);
+  const hints = (hintsOverride && hintsOverride.length) ? hintsOverride : egressHints(cfg);
   if (!hints.length) return null;
   let lastErr = null;
   const start = Number(cfg._egressHintIndex || 0);
@@ -2865,6 +3323,12 @@ export default {
       });
     }
     cfg.client_ip = clientIp(request);
+    // 控制台前端。根路径做内容协商:浏览器(Accept 带 text/html)拿页面,
+    // 探针/监控拿原来的健康检查 JSON,互不影响。
+    if (method === "GET" && (path === "/ui" || path === "/ui/")) return uiResponse();
+    if (method === "GET" && path === "/" && String(request.headers.get("accept") || "").indexOf("text/html") >= 0) {
+      return uiResponse();
+    }
     // 生成图片中转:公开端点 —— <img> 标签发不出 Authorization 头,
     // 所以以「不可猜的 key」当凭据,并单独限流防刷。
     if (method === "GET" && path.indexOf("/img/") === 0) {
@@ -2873,6 +3337,9 @@ export default {
       }
       return await handleImageProxy(path.slice(5), request, cfg, env);
     }
+    // 出口池按纯净度评分排序(缓存 60s,不给每次请求都加一次存储读)。
+    // 池为空(没配任何出口)时保持旧行为。
+    cfg._egressOrder = await egressOrderCached(cfg, env);
     const isHealthPath = path === "/" || path === "/health" || path === "/healthz";
     if (!isHealthPath && !checkRateLimit(cfg.client_ip, cfg)) {
       log(cfg, `rate limit exceeded: ${cfg.client_ip || "0.0.0.0"}`);
@@ -2948,6 +3415,8 @@ export default {
             image_proxy: !!cfg.image_proxy,
             public_origin: cfg.public_origin || "",
             r2_bound: !!env.FILECACHE,
+            egress_pool: (cfg._egressOrder || []).map((e) => e.id),
+            egress_force: cfg.egress_force || "",
             ts: Date.now(),
           });
         }
@@ -2961,6 +3430,14 @@ export default {
           if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
           return await handleAdminState(cfg, env, url);
         }
+        if (path === "/admin/egress") {
+          if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
+          return await handleAdminEgress(null, cfg, env, url, "GET");
+        }
+        if (path === "/admin/sessions") {
+          if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
+          return await handleAdminSessions(null, cfg, env, url, "GET");
+        }
         return jsonResponse({ error: "not found" }, 404);
       }
       if (method === "POST") {
@@ -2970,6 +3447,16 @@ export default {
           if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await handleAdminCookie(req, cfg, env);
+        }
+        if (path === "/admin/egress") {
+          if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleAdminEgress(req, cfg, env, url, "POST");
+        }
+        if (path === "/admin/sessions") {
+          if (!adminOk(request, url, cfg)) return jsonResponse({ error: { message: "admin key required" } }, 401);
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleAdminSessions(req, cfg, env, url, "POST");
         }
         if (path === "/v1/debug/raw") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
@@ -3029,6 +3516,15 @@ export default {
       if (cfg.gemini_fsid) patch.fsid = cfg.gemini_fsid;
       if (live.alive || patch.cookie) await saveState(env, patch);
       log(cfg, `cron refresh: status=${live.status} alive=${live.alive} set-cookie=${live.setCookieCount} rotated=${live.rotated}`);
+      // 顺带跑一轮出口纯净度测试(每 6h 一次,和 cron 同频)。
+      // 图片探针会真的调一次生成,所以受 EGRESS_PROBE_IMAGE 控制。
+      try {
+        cfg._egressOrder = await egressOrderCached(cfg, env);
+        const results = await runEgressTests(cfg, env, null, { image: !!cfg.egress_probe_image });
+        log(cfg, "egress probe: " + results.map((r) => `${r.label || r.id}=${r.text_status}/${r.image_status}:${r.score}`).join(" "));
+      } catch (e) {
+        log(cfg, `egress probe failed: ${(e && e.message) || e}`);
+      }
     })());
   },
 };
@@ -3043,9 +3539,11 @@ async function tryAltEgress(cfg, request, url, rawBody) {
     if (origin.host === url.host) continue;
     try {
       const headers = new Headers();
-      for (const n of ["authorization", "x-api-key", "content-type", "accept", "user-agent"]) {
-        const v = request.headers.get(n);
-        if (v) headers.set(n, v);
+      // 和白名单一样转发,否则回退时 X-Session-Id / X-Memory-Scope 会被吃掉。
+      for (const [n, v] of request.headers) {
+        const lower = n.toLowerCase();
+        if (["host", "content-length", "connection", "accept-encoding"].includes(lower) || lower.startsWith("cf-")) continue;
+        try { headers.set(n, v); } catch (_) { /* ignore */ }
       }
       headers.set("x-egress-fallback", "1");
       const resp = await fetch(base.replace(/\/$/, "") + url.pathname + url.search, {
@@ -3176,6 +3674,122 @@ async function handleAdminCookie(req, cfg, env) {
   const parts = cookie.split(";").map((x) => x.split("=")[0].trim()).filter(Boolean);
   return jsonResponse({ ok, cookie_len: cookie.length, cookie_fp: await shortHash(cookie, 12), names: parts, has_sapisid: !!patch.sapisid });
 }
+// ─── 运维:出口池 ────────────────────────────────────────────────────────────
+/** 代理 URL 带账号密码,回显时打码,别把凭据发到前端。 */
+function maskProxySpec(target) {
+  return String(target || "").replace(/:\/\/([^:@/]+):([^@/]*)@/, "://$1:***@");
+}
+function egressRow(entry, stat, forced) {
+  const s = stat || {};
+  return {
+    id: entry.id,
+    kind: entry.kind,
+    label: entry.label || entry.id,
+    target: entry.kind === "proxy" ? maskProxySpec(entry.target) : (entry.target || entry.kind),
+    forced: forced === entry.id || forced === entry.target,
+    text_status: s.text_status || "",
+    image_status: s.image_status || "",
+    latency_ms: Number(s.latency_ms || 0),
+    score: Number(s.score || 0),
+    runs: Number(s.runs || 0),
+    image_ok_runs: Number(s.image_ok_runs || 0),
+    updated_ts: Number(s.updated_ts || 0),
+    detail: s.detail || "",
+  };
+}
+async function handleAdminEgress(req, cfg, env, url, method) {
+  if (method === "GET") {
+    const [pool, stats, settings] = await Promise.all([
+      loadEgressPool(cfg, env), egressStatsAll(env), loadEgressSettings(env),
+    ]);
+    const forced = settings.force || cfg.egress_force || "";
+    const rows = pool.map((e) => egressRow(e, stats.get(e.id), forced)).sort((a, b) => b.score - a.score);
+    const order = (await egressOrderCached(cfg, env)).map((e) => e.id);
+    let stored = 0;
+    try {
+      await ensureSchema(env);
+      const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM egress_pool").first();
+      stored = Number((c && c.n) || 0);
+    } catch (_) { /* ignore */ }
+    return jsonResponse({
+      object: "list",
+      forced,
+      probe_image: settings.probe_image === undefined ? !!cfg.egress_probe_image : settings.probe_image === "1",
+      order,
+      source: stored ? "stored" : "default",
+      data: rows,
+    });
+  }
+  if (method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
+  const body = req || {};
+  const action = String(body.action || "").toLowerCase();
+  if (action === "test") {
+    const ids = Array.isArray(body.ids) ? body.ids : null;
+    const settings = await loadEgressSettings(env);
+    const withImage = body.image === undefined
+      ? (settings.probe_image === undefined ? !!cfg.egress_probe_image : settings.probe_image === "1")
+      : !!body.image;
+    const results = await runEgressTests(cfg, env, ids, { image: withImage });
+    _egressCache = { data: null, ts: 0 };
+    return jsonResponse({ ok: true, tested: results.length, results });
+  }
+  if (action === "pool") {
+    const saved = await saveEgressPool(env, body.pool || []);
+    _egressCache = { data: null, ts: 0 };
+    if (!saved) return jsonResponse({ error: { message: "出口池格式不合法(或 D1 未绑定)" } }, 400);
+    return jsonResponse({ ok: true, count: saved.length, pool: saved.map(entryToSpec) });
+  }
+  if (action === "force") {
+    const id = String(body.id || "").trim();
+    await saveEgressSetting(env, "force", id);
+    _egressCache = { data: null, ts: 0 };
+    return jsonResponse({ ok: true, forced: id });
+  }
+  if (action === "probe_image") {
+    await saveEgressSetting(env, "probe_image", body.enabled ? "1" : "");
+    return jsonResponse({ ok: true, probe_image: !!body.enabled });
+  }
+  return jsonResponse({ error: { message: "unknown action" } }, 400);
+}
+// ─── 运维:会话列表 ──────────────────────────────────────────────────────────
+async function handleAdminSessions(req, cfg, env, url, method) {
+  if (!env || !env.DB) return jsonResponse({ error: { message: "requires the D1 binding" } }, 503);
+  try {
+    await ensureSchema(env);
+    if (method === "GET") {
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 500);
+      const r = await env.DB.prepare(
+        "SELECT sid, cid, rid, model, turns, nmsgs, delta_mode, updated_ts FROM chat_sessions ORDER BY updated_ts DESC LIMIT ?1"
+      ).bind(limit).all();
+      const rows = ((r && r.results) || []).map((x) => ({
+        sid: x.sid,
+        cid: x.cid,
+        rid: x.rid,
+        model: x.model || "",
+        turns: Number(x.turns || 0),
+        messages: Number(x.nmsgs || 0),
+        delta_mode: !!x.delta_mode,
+        updated_ts: Number(x.updated_ts || 0),
+      }));
+      const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM chat_sessions").first();
+      return jsonResponse({ object: "list", total: Number((c && c.n) || 0), data: rows });
+    }
+    if (method === "POST") {
+      const body = req || {};
+      if (body.all) {
+        const r = await env.DB.prepare("DELETE FROM chat_sessions").run();
+        return jsonResponse({ ok: true, deleted: Number((r && r.meta && r.meta.changes) || 0) });
+      }
+      const sid = String(body.sid || "").trim();
+      if (!sid) return jsonResponse({ error: { message: "sid required" } }, 400);
+      const r = await env.DB.prepare("DELETE FROM chat_sessions WHERE sid = ?1").bind(sid).run();
+      return jsonResponse({ ok: true, deleted: Number((r && r.meta && r.meta.changes) || 0) });
+    }
+  } catch (e) {
+    return jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
+  }
+  return jsonResponse({ error: "method not allowed" }, 405);
+}
 // 原样返回上游 StreamGenerate 响应(排查 1060 / 图片结构时用)
 async function handleRawDebug(req, cfg) {
   const prompt = String(req.prompt || "Reply with one word: PONG");
@@ -3212,4 +3826,6 @@ export {
   fileRefCacheKey, pickFingerprint, handleRawDebug,
   syncHash, extractSessionMeta, sessionKey, planTurn, messageHash, renderSlice, renderMessageParts,
   memoryBlock, memoryList, memoryAdd, memoryScope, imageProxyUrl, imgKeyOf, handleImageProxy,
+  parseEgressSpec, entryToSpec, defaultEgressPool, scoreEgress, orderEgress, maskProxySpec, socks5Connect, streamSource,
+  httpOverSocket, proxyHttpFetch, applyEgressAttempt,
 };
