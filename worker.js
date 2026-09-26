@@ -148,16 +148,31 @@ const CONFIG = {
   EGRESS_POOL: "",
   // 强制使用某个出口(id 如 proxy:ab12cd34ef56 或 colo:weur);空 = 按纯净度评分自动择优
   EGRESS_FORCE: "",
-  // 纯净度探测是否顺带测「图片生成能不能出图」(图片才是真正卡人的指标,但会真的调一次生成)
-  EGRESS_PROBE_IMAGE: true,
-  // ── 官方 Gemini API 出图(可选补充通道)─────────────────────────────────
+  // 纯净度探测是否顺带测「图片生成能不能出图」。
+  // 默认关:实测**没有任何 Cloudflare 出口能出图**(图片生成受客户端指纹限制),
+  // 开着只会白烧请求,而请求量本身可能就是触发 Google 异常流量判定的因素之一。
+  // 接入了真正能出图的出口(外部代理/浏览器桥)之后再打开。
+  EGRESS_PROBE_IMAGE: false,
+  // ── 图片生成后端 ────────────────────────────────────────────────────────────
   // 网页端出图卡在「客户端 TLS/HTTP2 指纹」上(见 README),Worker 的 TLS 栈
-  // 伪装不了 Chrome,所以图片生成走官方 API 这条路。
-  // 配置 GEMINI_API_KEY 后:① 开放 /v1/images/generations;② 聊天里被
-  // 「无法创建图片」拒绝时自动改走官方 API 重试(客户端无需改动)。
+  // 伪装不了 Chrome。所以图片生成必须走独立后端;两条路都能拿到「Gemini 生的图」:
+  //   google       官方 Gemini API(`gemini-3.1-flash-image` = Nano Banana 2,
+  //                就是 Gemini 自己的图片模型)。**图片模型免费档配额为 0,需开计费。**
+  //   browser      本机浏览器桥:驱动真 Chrome 走网页端出图,是真 Gemini 的图,免费,
+  //                但依赖那台机器在线。
+  // 另注:workers-ai(CF 的 flux)**不是 Gemini 的模型**,除非明确只想要"有张图",
+  // 否则不要用。
+  IMAGE_BACKEND: "google",
   GEMINI_API_KEY: "",
   GEMINI_IMAGE_MODEL: "gemini-3.1-flash-image",
-  // 图片生成自动回退:网页端拒绝出图时,改用官方 API 重试
+  // 浏览器桥(见 bridge/README):Worker 落任务,本机桥轮询并回传图片字节
+  BRIDGE_SECRET: "",
+  BRIDGE_WAIT_MS: 60000,
+  // CF Workers AI(非 Gemini 模型,仅在明确想要"任意图"时启用)
+  CF_ACCOUNT_ID: "",
+  CF_AI_TOKEN: "",
+  CF_IMAGE_MODEL: "@cf/black-forest-labs/flux-1-schnell",
+  // 图片生成自动回退:网页端拒绝出图时,改用上面的后端重试
   IMAGE_FALLBACK_API: true,
   // ── SSE 心跳 ────────────────────────────────────────────────────────────
   // 生成期间定期发 SSE 注释行,避免客户端(尤其 Android OkHttp,默认读超时 10s)
@@ -327,10 +342,16 @@ function getConfig(env) {
     image_proxy_rate_max: Math.max(1, parseIntDefault(envOr(env, "IMAGE_PROXY_RATE_MAX", CONFIG.IMAGE_PROXY_RATE_MAX), 600)),
     egress_pool: String(envOr(env, "EGRESS_POOL", CONFIG.EGRESS_POOL) || ""),
     egress_force: String(envOr(env, "EGRESS_FORCE", CONFIG.EGRESS_FORCE) || "").trim(),
-    egress_probe_image: parseBool(envOr(env, "EGRESS_PROBE_IMAGE", CONFIG.EGRESS_PROBE_IMAGE), true),
+    egress_probe_image: parseBool(envOr(env, "EGRESS_PROBE_IMAGE", CONFIG.EGRESS_PROBE_IMAGE), false),
     sse_heartbeat_ms: Math.max(0, parseIntDefault(envOr(env, "SSE_HEARTBEAT_MS", CONFIG.SSE_HEARTBEAT_MS), 5000)),
     gemini_api_key: String(envOr(env, "GEMINI_API_KEY", CONFIG.GEMINI_API_KEY) || "").trim(),
     gemini_image_model: String(envOr(env, "GEMINI_IMAGE_MODEL", CONFIG.GEMINI_IMAGE_MODEL) || "gemini-3.1-flash-image"),
+    image_backend: String(envOr(env, "IMAGE_BACKEND", CONFIG.IMAGE_BACKEND) || "google").trim().toLowerCase(),
+    bridge_secret: String(envOr(env, "BRIDGE_SECRET", CONFIG.BRIDGE_SECRET) || "").trim(),
+    bridge_wait_ms: Math.max(0, parseIntDefault(envOr(env, "BRIDGE_WAIT_MS", CONFIG.BRIDGE_WAIT_MS), 60000)),
+    cf_account_id: String(envOr(env, "CF_ACCOUNT_ID", CONFIG.CF_ACCOUNT_ID) || "").trim(),
+    cf_ai_token: String(envOr(env, "CF_AI_TOKEN", CONFIG.CF_AI_TOKEN) || "").trim(),
+    cf_image_model: String(envOr(env, "CF_IMAGE_MODEL", CONFIG.CF_IMAGE_MODEL) || "@cf/black-forest-labs/flux-1-schnell"),
     image_fallback_api: parseBool(envOr(env, "IMAGE_FALLBACK_API", CONFIG.IMAGE_FALLBACK_API), true),
     _env: env,
     _ctx: null,
@@ -1127,11 +1148,35 @@ async function egressOrderCached(cfg, env) {
   _egressCache = { data: order, ts: now };
   return order;
 }
-/** 第 attempt 次尝试用池里第几个出口(按分数排序后轮换)。 */
+/** 出口冷却:某出口刚被 Google 判异常(1060 / 429 / 302 验证码页)时,
+ *  短时间内别再轮到它 —— 否则重试预算会被同一个坏出口连续吃掉,
+ *  最后把原始的 302 直接抛给调用方。冷却是有时效的,不会永久拉黑。 */
+const EGRESS_COOLDOWN_MS = 90000;
+const _egressCooldown = new Map(); // id -> 冷却截止时间
+function egressCooling(id) {
+  const until = _egressCooldown.get(id);
+  if (!until) return false;
+  if (Date.now() >= until) { _egressCooldown.delete(id); return false; }
+  return true;
+}
+function markEgressBad(cfg, ms) {
+  const e = cfg && cfg._egress;
+  if (!e || !e.id) return;
+  const w = ms || EGRESS_COOLDOWN_MS;
+  _egressCooldown.set(e.id, Date.now() + w);
+  log(cfg, `出口 ${e.label || e.id} 被上游判异常,冷却 ${Math.round(w / 1000)}s`);
+}
+function markEgressGood(cfg) {
+  const e = cfg && cfg._egress;
+  if (e && e.id) _egressCooldown.delete(e.id);
+}
+/** 第 attempt 次尝试用池里第几个出口(按分数排序,跳过正在冷却的)。 */
 function applyEgressAttempt(cfg, attempt) {
   const order = cfg && cfg._egressOrder;
   if (!order || !order.length) return;
-  const e = order[attempt % order.length];
+  const usable = order.filter((e) => !egressCooling(e.id));
+  const list = usable.length ? usable : order; // 全在冷却才退回去硬试
+  const e = list[attempt % list.length];
   cfg._egress = e;
   if (e.kind === "colo" && e.target) cfg._egressHint = e.target;
 }
@@ -1831,11 +1876,13 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
         }
         log(cfg, `upstream status=${resp.status} rawLen=${raw.length} parsedLen=0 snippet=${JSON.stringify(raw.slice(0, 200))}`);
       }
+      markEgressGood(cfg);
       return text;
     } catch (e) {
       lastErr = e;
-      // 1060 / 429 这类出口问题不在本函数里死磕:立刻上抛,由 berrRetry 换出口
-      if (isRetryableUpstream(e)) throw e;
+      // 1060 / 429 这类出口问题不在本函数里死磕:立刻上抛,由 berrRetry 换出口。
+      // 同时把这个出口标记为冷却,避免下一轮又轮到它。
+      if (isRetryableUpstream(e)) { markEgressBad(cfg); throw e; }
       if (attempt < cfg.retry_attempts - 1) {
         log(cfg, `Retry ${attempt + 1}/${cfg.retry_attempts}: ${e}`);
         await sleep(retryDelayMs(cfg, attempt));
@@ -1962,9 +2009,11 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
       lastErr = e;
       if (!yielded && attempt < cfg.retry_attempts - 1) {
         log(cfg, `Stream retry ${attempt + 1}/${cfg.retry_attempts}: ${e}`);
+        if (isRetryableUpstream(e)) markEgressBad(cfg);
         await sleep(retryDelayMs(cfg, attempt));
         continue;
       }
+      if (isRetryableUpstream(e)) markEgressBad(cfg);
       throw e;
     }
   }
@@ -2306,6 +2355,23 @@ const EMPTY_UPSTREAM_MSG =
   "Cloudflare 出口 IP 被 Google 限流时常见(表现为 BardErrorInfo[1060] 或 HTTP 429+reCAPTCHA)。" +
   "可选处理:多配几个入口(ALT_EGRESS / gemini-router 多通道)换出口;确认 GEMINI_BL 与 cookie 是否过期;" +
   "用 `wrangler tail` 或 GET /debug 看上游真实状态码。";
+/**
+ * 把上游异常翻译成对调用方有用的报错。
+ * 机器人校验类(302→google.com/sorry、reCAPTCHA)是**出口侧、且往往是间歇的**,
+ * 直接抛原始状态码会让人以为是自己请求错了,所以这里说清原因与建议。
+ */
+function upstreamErrorMessage(e) {
+  const s = String((e && e.message) || e);
+  if (/bot-check|recaptcha|sorry\/index|unusual traffic/i.test(s)) {
+    return "upstream error: " + s +
+      " —— 该出口 IP 被 Google 判为异常流量(通常是间歇的,过一会儿或换个出口即可)。" +
+      "可在 /admin/egress 看到每个出口的状态并手动测试/指定。";
+  }
+  if (isBardError(e)) {
+    return "upstream error: " + s + "(Gemini 侧风控;可换出口重试)";
+  }
+  return "upstream error: " + s;
+}
 // POST /v1/chat/completions
 async function handleChat(req, cfg, request) {
   const rm = resolveModel(req.model || cfg.default_model, cfg.default_model);
@@ -2374,7 +2440,7 @@ async function handleChat(req, cfg, request) {
           chunk({ content: delta }, null);
         }
       } catch (e) {
-        errMsg = `⚠️ upstream error: ${e}`;
+        errMsg = `⚠️ upstream error: ${upstreamErrorMessage(e)}`;
       } finally {
         if (!got) {
           const note = errMsg || EMPTY_UPSTREAM_MSG;
@@ -2401,7 +2467,7 @@ async function handleChat(req, cfg, request) {
     text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
   } catch (e) {
     await finishTurn(false, "");
-    return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
+    return jsonResponse({ error: { message: upstreamErrorMessage(e) } }, 502);
   }
   let toolCalls = null;
   if (tools && text && toolChoice !== "none") {
@@ -3402,7 +3468,7 @@ async function officialImageGenerate(cfg, prompt, opts) {
   });
   const text = await r.text();
   if (!r.ok) {
-    throw new Error(`官方 API ${r.status}: ${text.slice(0, 300)}`);
+    throw new Error(`官方 API ${r.status}: ${text.slice(0, 1200)}`);
   }
   let j;
   try { j = JSON.parse(text); } catch (_) { throw new Error("官方 API 返回非 JSON: " + text.slice(0, 200)); }
@@ -3430,6 +3496,66 @@ async function publishImageBytes(cfg, env, bytes, mime, seed) {
   }
   const origin = cfg.public_origin || "";
   return origin ? `${origin}/img/${key}` : "";
+}
+/**
+ * 官方 API 诊断:列出该 key 可用的模型(不消耗生成额度),或试跑一次生成。
+ * 用来在配 key 前先看清额度/可用性。
+ */
+async function handleOfficialDiag(req, cfg) {
+  const key = cfg && cfg.gemini_api_key;
+  if (!key) return jsonResponse({ error: { message: "GEMINI_API_KEY 未配置" } }, 503);
+  const action = String(req.action || "models").toLowerCase();
+  if (action === "models") {
+    try {
+      const r = await fetch(`${OFFICIAL_API_BASE}/models?pageSize=200`, {
+        headers: { "x-goog-api-key": key }, signal: timeoutSignal(30000),
+      });
+      const text = await r.text();
+      if (!r.ok) return jsonResponse({ ok: false, status: r.status, body: text.slice(0, 1500) }, 200);
+      let j;
+      try { j = JSON.parse(text); } catch (_) { return jsonResponse({ ok: false, body: text.slice(0, 500) }, 200); }
+      const all = (j.models || []).map((m) => ({
+        name: String(m.name || "").replace(/^models\//, ""),
+        methods: m.supportedGenerationMethods || [],
+      }));
+      const imageish = all.filter((m) => /image/i.test(m.name));
+      return jsonResponse({
+        ok: true, total: all.length,
+        image_models: imageish,
+        configured_model_available: all.some((m) => m.name === cfg.gemini_image_model),
+        sample: all.slice(0, 40).map((m) => m.name),
+      });
+    } catch (e) {
+      return jsonResponse({ ok: false, error: String((e && e.message) || e) }, 200);
+    }
+  }
+  if (action === "generate") {
+    const model = String(req.model || cfg.gemini_image_model);
+    const prompt = String(req.prompt || "a red apple");
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`${OFFICIAL_API_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST",
+        headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+        signal: timeoutSignal(120000),
+      });
+      const text = await r.text();
+      let got = 0, mime = "";
+      try {
+        const j = JSON.parse(text);
+        const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+        for (const p of parts) {
+          const inl = p.inlineData || p.inline_data;
+          if (inl && inl.data) { got++; mime = inl.mimeType || inl.mime_type || ""; }
+        }
+      } catch (_) { /* 不是 JSON */ }
+      return jsonResponse({ ok: r.ok, status: r.status, ms: Date.now() - t0, model, images: got, mime, body: r.ok && got ? "" : text.slice(0, 1500) }, 200);
+    } catch (e) {
+      return jsonResponse({ ok: false, model, ms: Date.now() - t0, error: String((e && e.message) || e) }, 200);
+    }
+  }
+  return jsonResponse({ error: { message: "action 需为 models 或 generate" } }, 400);
 }
 /** POST /v1/images/generations —— OpenAI 兼容的图片生成端点。 */
 async function handleImagesGenerations(req, cfg, env) {
@@ -3758,6 +3884,10 @@ export default {
         if (path === "/v1/debug/egress") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await handleEgressDiag(req, cfg);
+        }
+        if (path === "/v1/debug/official") {
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleOfficialDiag(req, cfg);
         }
         if (path === "/v1/memories") {
           return await handleMemories(request, cfg, env, url, "POST", req);
@@ -4249,6 +4379,7 @@ export {
   syncHash, extractSessionMeta, sessionKey, planTurn, messageHash, renderSlice, renderMessageParts,
   memoryBlock, memoryList, memoryAdd, memoryScope, imageProxyUrl, imgKeyOf, handleImageProxy,
   sseResponse, extractEgressLocation,
+  egressCooling, markEgressBad, markEgressGood, upstreamErrorMessage,
   officialImageGenerate, publishImageBytes, imageFallbackViaApi, handleImagesGenerations,
   parseEgressSpec, entryToSpec, defaultEgressPool, scoreEgress, orderEgress, maskProxySpec, socks5Connect, streamSource,
   httpOverSocket, proxyHttpFetch, applyEgressAttempt,

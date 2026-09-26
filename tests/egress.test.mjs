@@ -10,7 +10,46 @@ import {
   socks5Connect,
   streamSource,
   defaultEgressPool,
-} from "../worker.js";
+  egressCooling,
+  markEgressBad,
+  markEgressGood,
+  upstreamErrorMessage,} from "../worker.js";
+
+test("a failed exit is cooled down so retries do not land on it again", () => {
+  // 回归:某个出口被 Google 回 302 验证码页时,重试若又轮到同一个出口,
+  // 重试预算会被连续吃掉,最后把原始 302 抛给调用方。
+  const cfg = { _egress: { id: "colo:xx", label: "XX" } };
+  assert.equal(egressCooling("colo:xx"), false);
+  markEgressBad(cfg);
+  assert.equal(egressCooling("colo:xx"), true, "should be cooling right after a failure");
+  markEgressGood(cfg);
+  assert.equal(egressCooling("colo:xx"), false, "a success must clear the cooldown");
+});
+
+test("cooldown expires and does not blacklist an exit forever", () => {
+  const cfg = { _egress: { id: "colo:tmp", label: "TMP" } };
+  markEgressBad(cfg, 1); // 1ms 冷却
+  return new Promise((r) => setTimeout(r, 10)).then(() => {
+    assert.equal(egressCooling("colo:tmp"), false, "cooldown must expire");
+  });
+});
+
+test("markEgressBad tolerates a missing egress (no pool configured)", () => {
+  assert.doesNotThrow(() => markEgressBad({}));
+  assert.doesNotThrow(() => markEgressGood({}));
+  assert.doesNotThrow(() => markEgressBad(null));
+});
+
+test("upstreamErrorMessage explains a bot-check instead of leaking a bare status", () => {
+  const bot = upstreamErrorMessage(new Error("Gemini upstream HTTP 302 (bot-check / reCAPTCHA page)"));
+  assert.match(bot, /302/);
+  assert.match(bot, /异常流量/);
+  assert.match(bot, /admin\/egress/);
+  // 普通错误不被改写
+  const plain = upstreamErrorMessage(new Error("socket hang up"));
+  assert.match(plain, /socket hang up/);
+  assert.doesNotMatch(plain, /异常流量/);
+});
 
 test("entryToSpec round-trips every kind through parseEgressSpec", () => {
   // 回归:出口池存进 D1 时 colo 的 target 只是 "weur",读回来必须能还原成
