@@ -53,7 +53,6 @@ export const UI_HTML = `<!doctype html>
   .msg.user { align-self: flex-end; background: #23405f; }
   .msg.bot { align-self: flex-start; background: var(--panel2); }
   .msg.sys { align-self: center; background: transparent; color: var(--dim); font-size: 12px; }
-  .msg img { max-width: 100%; border-radius: 8px; margin-top: 8px; display: block; }
   .composer { display: flex; gap: 8px; margin-top: 12px; align-items: flex-end; }
   .composer textarea { flex: 1; resize: vertical; min-height: 44px; max-height: 200px; }
   .bar { height: 6px; border-radius: 3px; background: var(--panel2); overflow: hidden; min-width: 64px; }
@@ -151,13 +150,12 @@ export const UI_HTML = `<!doctype html>
       <div class="row">
         <h2 style="margin:0">出口池 · 纯净度排序</h2>
         <span class="grow" style="flex:1"></span>
-        <label class="chip"><input type="checkbox" id="probeImg" checked> 图片探针</label>
         <button id="testEgress">测试全部</button>
         <button id="reloadEgress">刷新</button>
       </div>
       <div class="hint" id="egressHint" style="margin:8px 0"></div>
       <div class="scroll"><table><thead><tr>
-        <th>出口</th><th>分数</th><th>文本</th><th>图片</th><th>延迟</th><th>最近</th><th></th>
+        <th>出口</th><th>分数</th><th>文本</th><th>延迟</th><th>最近</th><th></th>
       </tr></thead><tbody id="egressBody"></tbody></table></div>
     </div>
     <div class="card">
@@ -180,7 +178,6 @@ export const UI_HTML = `<!doctype html>
       <h2 style="margin:0">运行状态</h2><span class="grow" style="flex:1"></span>
       <button id="reloadStatus">刷新</button>
     </div><div class="kv" id="statusKv"></div></div>
-    <div class="card"><h2>图片缓存预算</h2><div class="kv" id="imgKv"></div></div>
   </section>
 </main>
 
@@ -345,13 +342,6 @@ export const UI_HTML = `<!doctype html>
     function render() {
       clear(bubble);
       bubble.textContent = acc;
-      // 图片链接渲染成真图(走本服务的 /img 中转)
-      var re = /!\\[[^\\]]*\\]\\((https?:\\/\\/[^)\\s]+)\\)/g, m;
-      while ((m = re.exec(acc)) !== null) {
-        var img = document.createElement("img");
-        img.src = m[1]; img.loading = "lazy";
-        bubble.appendChild(img);
-      }
       $("log").scrollTop = $("log").scrollHeight;
     }
     function renderFinal() { render(); }
@@ -470,7 +460,6 @@ export const UI_HTML = `<!doctype html>
       $("egressHint").textContent = "共 " + d.data.length + " 个出口,来源:" +
         (d.source === "stored" ? "已保存配置" : "默认配置") +
         (d.forced ? " · 已强制 " + d.forced : " · 按分数自动择优");
-      $("probeImg").checked = !!d.probe_image;
       $("poolText").value = d.data.map(function (e) { return e.kind === "proxy" ? e.target : e.target === "direct" ? "direct" : "colo:" + e.target; }).join("\\n");
       var tb = $("egressBody"); clear(tb);
       d.data.forEach(function (e) {
@@ -478,7 +467,6 @@ export const UI_HTML = `<!doctype html>
         tr.appendChild(el("td", "mono", e.label + (e.forced ? " ★" : "")));
         var sc = el("td"); sc.appendChild(scoreBar(e.score)); tr.appendChild(sc);
         tr.appendChild(el("td", null, textStatus(e.text_status)));
-        tr.appendChild(el("td", null, imgStatus(e.image_status)));
         tr.appendChild(el("td", "mono", e.latency_ms ? e.latency_ms + "ms" : "—"));
         tr.appendChild(el("td", "muted", fmtTime(e.updated_ts)));
         var td = el("td");
@@ -494,7 +482,7 @@ export const UI_HTML = `<!doctype html>
           one.disabled = true; one.textContent = "测试中";
           api("/admin/egress", {
             method: "POST",
-            body: JSON.stringify({ action: "test", ids: [e.id], image: $("probeImg").checked })
+            body: JSON.stringify({ action: "test", ids: [e.id] })
           }).then(function () { loadEgress(); });
         };
         td.appendChild(force); td.appendChild(document.createTextNode(" ")); td.appendChild(one);
@@ -513,25 +501,14 @@ export const UI_HTML = `<!doctype html>
     if (s === "error") return "错误";
     return s;
   }
-  function imgStatus(s) {
-    if (!s || s === "skipped") return "未测";
-    if (s === "ok") return "可出图";
-    if (s === "blocked") return "被拒";
-    return "错误";
-  }
   $("reloadEgress").onclick = loadEgress;
   $("testEgress").onclick = function () {
     var b = $("testEgress"); b.disabled = true; b.textContent = "测试中…";
-    $("egressHint").textContent = "正在逐个探测(含图片生成,可能要几分钟)…";
+    $("egressHint").textContent = "正在逐个探测(可能要一会儿)…";
     api("/admin/egress", {
-      method: "POST", body: JSON.stringify({ action: "test", image: $("probeImg").checked })
+      method: "POST", body: JSON.stringify({ action: "test" })
     }).then(function () { b.disabled = false; b.textContent = "测试全部"; loadEgress(); })
       .catch(function () { b.disabled = false; b.textContent = "测试全部"; loadEgress(); });
-  };
-  $("probeImg").onchange = function () {
-    api("/admin/egress", {
-      method: "POST", body: JSON.stringify({ action: "probe_image", enabled: $("probeImg").checked })
-    });
   };
   $("savePool").onclick = function () {
     var list = $("poolText").value.split("\\n").map(function (s) { return s.trim(); }).filter(Boolean);
@@ -568,18 +545,10 @@ export const UI_HTML = `<!doctype html>
         ["模型数", h.model_count], ["cookie", h.cookie ? "已配置" : "缺失"],
         ["cookie 来源", s.cookie_source || "—"], ["构建号 BL", h.bl || "—"],
         ["出口池", (h.egress_pool || []).join(", ") || "—"],
+        ["择优顺序", ((eg && eg.order) || []).join(" → ") || "—"],
         ["强制出口", h.egress_force || "自动"],
         ["会话续聊", h.session_memory ? "开" : "关"], ["长期记忆", h.memory ? "开" : "关"],
-        ["记忆自动提炼", h.memory_auto_extract ? "开" : "关"],
-        ["图片中转", h.image_proxy ? "开" : "关"], ["对外域名", h.public_origin || "未配置"],
-        ["R2", h.r2_bound ? "已绑定" : "未绑定"],
-        ["出口探测", s.egress_probe_image === undefined ? "—" : String(s.egress_probe_image)]
-      ]);
-      var rows = (eg && eg.data) || [];
-      var imageCapable = rows.filter(function (r) { return r.image_status === "ok"; });
-      kv($("imgKv"), [
-        ["可出图出口", imageCapable.length ? imageCapable.map(function (r) { return r.label; }).join(", ") : "暂无(受上游账号/出口限制)"],
-        ["当前择优顺序", (eg && eg.order || []).join(" → ") || "—"]
+        ["记忆自动提炼", h.memory_auto_extract ? "开" : "关"]
       ]);
     }).catch(function (e) { kv($("statusKv"), [["错误", String(e.message || e)]]); });
   }

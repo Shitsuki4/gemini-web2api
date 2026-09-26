@@ -27,8 +27,7 @@ export default {
       const resp = await fetch(upstream, init);
       const out = new Headers(resp.headers);
       out.delete("content-encoding");
-      // 默认给 API 响应打 no-store;但 /img/* 是图片,上游已经给了 Cache-Control,
-      // 覆盖掉会让图片无法缓存(每次都穿透到 R2)。
+      // 默认给 API 响应打 no-store;上游自己给了 Cache-Control 就用上游的。
       if (!out.get("cache-control")) out.set("cache-control", "no-store");
       return new Response(resp.body, { status: resp.status, headers: out });
     } catch (e) {

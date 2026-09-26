@@ -124,56 +124,16 @@ const CONFIG = {
   MEMORY_MAX_ITEMS: 200,
   // 注入到 prompt 里的记忆块字节上限(超了按更新时间截断)。
   MEMORY_INJECT_MAX_BYTES: 8000,
-  // ── 生成图片:经本 worker 的域名中转 ────────────────────────────────
-  // 上游返回的 googleusercontent 直链会改写成 <PUBLIC_ORIGIN>/img/<key>。
-  IMAGE_PROXY: true,
-  // 对外真正可达的源(必须显式配置:生产入口是 gemini-proxy 中转,
-  // worker 从 request.url 推导出来的是 workers.dev,用户访问不到)。
-  PUBLIC_ORIGIN: "",
-  IMAGE_R2_STORE: true,
-  // R2 月度写入上限(字节)。R2 免费额度 10 GB-月,默认 4 GiB 留足余量;
-  // 超了就不再写 R2,图片仍走边缘缓存/实时回源,功能不受影响。
-  IMAGE_R2_MONTHLY_MAX_BYTES: 4294967296,
-  // 单张超过这个大小不落 R2。
-  IMAGE_OBJECT_MAX_BYTES: 12582912,
-  // 图片缓存时间(秒),与 R2 的 7 天生命周期规则对齐。
-  IMAGE_CACHE_TTL_SEC: 604800,
-  IMAGE_PROXY_RATE_MAX: 600,
   // ── 出口池(换掉 Google 看到的 IP)──────────────────────────────────────
-  // 逗号分隔,三种写法混用:
+  // 逗号分隔,四种写法混用:
   //   colo:weur                              Cloudflare 机房(经 EgressRelay DO)
   //   proxy:socks5://user:pass@1.2.3.4:1080  外部代理(也支持 http:// / https://)
+  //   relay:1.2.3.4:443                      盲转发中继(edgetunnel 的 PROXYIP)
   //   direct                                 直接用 Worker 自带出口
-  // 留空则沿用 EGRESS_HINT / EGRESS_FALLBACK_HINTS。运行时可经 /admin/egress 热改(存 KV)。
+  // 留空则沿用 EGRESS_HINT / EGRESS_FALLBACK_HINTS。运行时可经 /admin/egress 热改(存 D1)。
   EGRESS_POOL: "",
   // 强制使用某个出口(id 如 proxy:ab12cd34ef56 或 colo:weur);空 = 按纯净度评分自动择优
   EGRESS_FORCE: "",
-  // 纯净度探测是否顺带测「图片生成能不能出图」。
-  // 默认关:实测**没有任何 Cloudflare 出口能出图**(图片生成受客户端指纹限制),
-  // 开着只会白烧请求,而请求量本身可能就是触发 Google 异常流量判定的因素之一。
-  // 接入了真正能出图的出口(外部代理/浏览器桥)之后再打开。
-  EGRESS_PROBE_IMAGE: false,
-  // ── 图片生成后端 ────────────────────────────────────────────────────────────
-  // 网页端出图卡在「客户端 TLS/HTTP2 指纹」上(见 README),Worker 的 TLS 栈
-  // 伪装不了 Chrome。所以图片生成必须走独立后端;两条路都能拿到「Gemini 生的图」:
-  //   google       官方 Gemini API(`gemini-3.1-flash-image` = Nano Banana 2,
-  //                就是 Gemini 自己的图片模型)。**图片模型免费档配额为 0,需开计费。**
-  //   browser      本机浏览器桥:驱动真 Chrome 走网页端出图,是真 Gemini 的图,免费,
-  //                但依赖那台机器在线。
-  // 另注:workers-ai(CF 的 flux)**不是 Gemini 的模型**,除非明确只想要"有张图",
-  // 否则不要用。
-  IMAGE_BACKEND: "google",
-  GEMINI_API_KEY: "",
-  GEMINI_IMAGE_MODEL: "gemini-3.1-flash-image",
-  // 浏览器桥(见 bridge/README):Worker 落任务,本机桥轮询并回传图片字节
-  BRIDGE_SECRET: "",
-  BRIDGE_WAIT_MS: 60000,
-  // CF Workers AI(非 Gemini 模型,仅在明确想要"任意图"时启用)
-  CF_ACCOUNT_ID: "",
-  CF_AI_TOKEN: "",
-  CF_IMAGE_MODEL: "@cf/black-forest-labs/flux-1-schnell",
-  // 图片生成自动回退:网页端拒绝出图时,改用上面的后端重试
-  IMAGE_FALLBACK_API: true,
   // ── SSE 心跳 ────────────────────────────────────────────────────────────
   // 生成期间定期发 SSE 注释行,避免客户端(尤其 Android OkHttp,默认读超时 10s)
   // 在静默期判定连接已死、报 "unexpected end of stream"。0 = 关闭。
@@ -333,26 +293,9 @@ function getConfig(env) {
     memory_auto_extract: parseBool(envOr(env, "MEMORY_AUTO_EXTRACT", CONFIG.MEMORY_AUTO_EXTRACT), false),
     memory_max_items: Math.max(1, parseIntDefault(envOr(env, "MEMORY_MAX_ITEMS", CONFIG.MEMORY_MAX_ITEMS), 200)),
     memory_inject_max_bytes: Math.max(0, parseIntDefault(envOr(env, "MEMORY_INJECT_MAX_BYTES", CONFIG.MEMORY_INJECT_MAX_BYTES), 8000)),
-    image_proxy: parseBool(envOr(env, "IMAGE_PROXY", CONFIG.IMAGE_PROXY), true),
-    public_origin: String(envOr(env, "PUBLIC_ORIGIN", CONFIG.PUBLIC_ORIGIN) || "").replace(/\/+$/, ""),
-    image_r2_store: parseBool(envOr(env, "IMAGE_R2_STORE", CONFIG.IMAGE_R2_STORE), true),
-    image_r2_monthly_max_bytes: Math.max(0, parseIntDefault(envOr(env, "IMAGE_R2_MONTHLY_MAX_BYTES", CONFIG.IMAGE_R2_MONTHLY_MAX_BYTES), 4294967296)),
-    image_object_max_bytes: Math.max(1024, parseIntDefault(envOr(env, "IMAGE_OBJECT_MAX_BYTES", CONFIG.IMAGE_OBJECT_MAX_BYTES), 12582912)),
-    image_cache_ttl_sec: Math.max(60, parseIntDefault(envOr(env, "IMAGE_CACHE_TTL_SEC", CONFIG.IMAGE_CACHE_TTL_SEC), 604800)),
-    image_proxy_rate_max: Math.max(1, parseIntDefault(envOr(env, "IMAGE_PROXY_RATE_MAX", CONFIG.IMAGE_PROXY_RATE_MAX), 600)),
     egress_pool: String(envOr(env, "EGRESS_POOL", CONFIG.EGRESS_POOL) || ""),
     egress_force: String(envOr(env, "EGRESS_FORCE", CONFIG.EGRESS_FORCE) || "").trim(),
-    egress_probe_image: parseBool(envOr(env, "EGRESS_PROBE_IMAGE", CONFIG.EGRESS_PROBE_IMAGE), false),
     sse_heartbeat_ms: Math.max(0, parseIntDefault(envOr(env, "SSE_HEARTBEAT_MS", CONFIG.SSE_HEARTBEAT_MS), 5000)),
-    gemini_api_key: String(envOr(env, "GEMINI_API_KEY", CONFIG.GEMINI_API_KEY) || "").trim(),
-    gemini_image_model: String(envOr(env, "GEMINI_IMAGE_MODEL", CONFIG.GEMINI_IMAGE_MODEL) || "gemini-3.1-flash-image"),
-    image_backend: String(envOr(env, "IMAGE_BACKEND", CONFIG.IMAGE_BACKEND) || "google").trim().toLowerCase(),
-    bridge_secret: String(envOr(env, "BRIDGE_SECRET", CONFIG.BRIDGE_SECRET) || "").trim(),
-    bridge_wait_ms: Math.max(0, parseIntDefault(envOr(env, "BRIDGE_WAIT_MS", CONFIG.BRIDGE_WAIT_MS), 60000)),
-    cf_account_id: String(envOr(env, "CF_ACCOUNT_ID", CONFIG.CF_ACCOUNT_ID) || "").trim(),
-    cf_ai_token: String(envOr(env, "CF_AI_TOKEN", CONFIG.CF_AI_TOKEN) || "").trim(),
-    cf_image_model: String(envOr(env, "CF_IMAGE_MODEL", CONFIG.CF_IMAGE_MODEL) || "@cf/black-forest-labs/flux-1-schnell"),
-    image_fallback_api: parseBool(envOr(env, "IMAGE_FALLBACK_API", CONFIG.IMAGE_FALLBACK_API), true),
     _env: env,
     _ctx: null,
     _cookieSource: cookieEntries.length > 1 ? "env-pool" : (env.GEMINI_COOKIE || env.GEMINI_COOKIES || env.COOKIE_STRING ? "env" : (CONFIG.GEMINI_COOKIE ? "builtin" : "none")),
@@ -977,13 +920,11 @@ async function saveEgressSetting(env, k, v) {
 // ── 纯净度评分 ──────────────────────────────────────────────────────────────
 // 分数只反映「这个出口对 Gemini 有多干净」,不看带宽。基准:
 //   文本通 40 / 通但空 10 / 429(能连上、只是被限流)4 / 5xx 2 / 1060 或超时 0
-//   图片能出图再 +50 —— 图片才是真正卡人的指标
 //   拿到过响应再按延迟加 0~10 分
 const TEXT_SCORE = { ok: 40, empty: 10, "429": 4, http500: 2, http502: 2, http503: 2, html: 0, timeout: 0, error: 0, "1060": 0 };
 function scoreEgress(row) {
   if (!row) return 0;
   let s = TEXT_SCORE[row.text_status] != null ? TEXT_SCORE[row.text_status] : (row.text_status ? 1 : 0);
-  if (row.image_status === "ok") s += 50;
   const lat = Number(row.latency_ms || 0);
   if (lat > 0) s += Math.max(0, 10 - Math.min(10, lat / 1200));
   return Math.max(0, Math.min(100, Math.round(s)));
@@ -1004,7 +945,7 @@ async function egressStatPut(env, entry, patch) {
     await ensureSchema(env);
     const prev = await env.DB.prepare("SELECT * FROM egress_stats WHERE id = ?1").bind(entry.id).first();
     const row = Object.assign(
-      { runs: 0, ok_runs: 0, image_ok_runs: 0, fails: 0, latency_ms: 0, text_status: "", image_status: "" },
+      { runs: 0, ok_runs: 0, fails: 0, latency_ms: 0, text_status: "" },
       prev || {}, patch || {}
     );
     row.kind = entry.kind;
@@ -1014,16 +955,16 @@ async function egressStatPut(env, entry, patch) {
     row.score = scoreEgress(row);
     row.updated_ts = Date.now();
     await env.DB.prepare(
-      "INSERT INTO egress_stats (id, kind, target, label, text_status, image_status, latency_ms, runs, ok_runs, " +
-      "image_ok_runs, fails, score, detail, updated_ts) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) " +
+      "INSERT INTO egress_stats (id, kind, target, label, text_status, latency_ms, runs, ok_runs, " +
+      "fails, score, detail, updated_ts) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) " +
       "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, target=excluded.target, label=excluded.label, " +
-      "text_status=excluded.text_status, image_status=excluded.image_status, latency_ms=excluded.latency_ms, " +
-      "runs=excluded.runs, ok_runs=excluded.ok_runs, image_ok_runs=excluded.image_ok_runs, fails=excluded.fails, " +
+      "text_status=excluded.text_status, latency_ms=excluded.latency_ms, " +
+      "runs=excluded.runs, ok_runs=excluded.ok_runs, fails=excluded.fails, " +
       "score=excluded.score, detail=excluded.detail, updated_ts=excluded.updated_ts"
     ).bind(
-      entry.id, row.kind, row.target, row.label, row.text_status || "", row.image_status || "",
+      entry.id, row.kind, row.target, row.label, row.text_status || "",
       Number(row.latency_ms || 0) | 0, row.runs | 0, Number(row.ok_runs || 0) | 0,
-      Number(row.image_ok_runs || 0) | 0, Number(row.fails || 0) | 0, row.score,
+      Number(row.fails || 0) | 0, row.score,
       row.detail == null ? null : String(row.detail).slice(0, 400), row.updated_ts
     ).run();
     return row;
@@ -1052,8 +993,8 @@ function extractEgressLocation(raw) {
   const m = /"([^"]{2,40})","SWML_DESCRIPTION_FROM_YOUR_INTERNET_ADDRESS"/.exec(flat);
   return m ? m[1] : "";
 }
-/** 一次纯净度探测:先文本探针,再(可选)图片探针 —— 图片才是真正卡人的指标。 */
-async function probeEgress(cfg, env, entry, opts) {
+/** 一次纯净度探测:发一个最小文本请求,看上游认不认这个出口。 */
+async function probeEgress(cfg, env, entry) {
   const probeCfg = Object.assign({}, cfg, {
     _env: env, _egress: entry, do_egress: false, alt_transport: false,
     fingerprint_jitter_ms: 0, retry_attempts: 1, log_requests: false,
@@ -1082,50 +1023,24 @@ async function probeEgress(cfg, env, entry, opts) {
     textStatus = /timeout|abort/i.test(String((e && e.message) || e)) ? "timeout" : "error";
     detail = String((e && e.message) || e).slice(0, 200);
   }
-  let imageStatus = "skipped";
-  if (opts && opts.image) {
-    try {
-      const ibody = buildPayload("Generate a small image of a red apple.", m.modeId, m.thinkMode, null, m.extra, probeCfg);
-      const iheaders = await buildHeaders(probeCfg);
-      const iresp = await httpFetch(getUrl(probeCfg), { method: "POST", headers: iheaders, body: ibody, timeoutMs: 90000, socket: true, cfg: probeCfg });
-      const iraw = await iresp.text();
-      // 位置块通常只出现在「带内容」的响应里,极简回答没有 —— 从图片探针再取一次
-      if (!location) location = extractEgressLocation(iraw);
-      if (/BardErrorInfo[^0-9]{0,20}(\d{3,5})/.test(iraw) || !iresp.ok) imageStatus = "error";
-      else if (IMAGE_REGION_RE.test(iraw)) imageStatus = "blocked";
-      else {
-        const imgs = [];
-        for (const line of iraw.split("\n")) {
-          for (const im of extractPartsFromLine(line).images) {
-            if (!imgs.some((x) => x.url === im.url)) imgs.push(im);
-          }
-        }
-        imageStatus = imgs.length ? "ok" : "blocked";
-      }
-    } catch (_) {
-      imageStatus = "error";
-    }
-  }
   const prev = (await egressStatsAll(env)).get(entry.id) || {};
   return egressStatPut(env, entry, {
     text_status: textStatus,
-    image_status: imageStatus,
     latency_ms: latency,
     detail: [location ? "loc=" + location : "", detail].filter(Boolean).join(" "),
     runs: Number(prev.runs || 0) + 1,
     ok_runs: Number(prev.ok_runs || 0) + (textStatus === "ok" ? 1 : 0),
-    image_ok_runs: Number(prev.image_ok_runs || 0) + (imageStatus === "ok" ? 1 : 0),
     fails: Number(prev.fails || 0) + (textStatus === "ok" ? 0 : 1),
   });
 }
 /** 跑一轮出口纯净度测试,返回排序后的结果。 */
-async function runEgressTests(cfg, env, ids, opts) {
+async function runEgressTests(cfg, env, ids) {
   const pool = await loadEgressPool(cfg, env);
   const want = Array.isArray(ids) && ids.length ? pool.filter((e) => ids.includes(e.id)) : pool;
   const results = [];
   for (const entry of want) {
     try {
-      results.push(await probeEgress(cfg, env, entry, opts));
+      results.push(await probeEgress(cfg, env, entry));
     } catch (e) {
       results.push({ id: entry.id, label: entry.label, error: String((e && e.message) || e) });
     }
@@ -1143,7 +1058,6 @@ async function egressOrderCached(cfg, env) {
   const [stats, settings] = await Promise.all([egressStatsAll(env), loadEgressSettings(env)]);
   const force = settings.force || cfg.egress_force || "";
   cfg._egressForce = force;
-  if (settings.probe_image !== undefined) cfg.egress_probe_image = settings.probe_image === "1";
   const order = orderEgress(pool, stats, force);
   _egressCache = { data: order, ts: now };
   return order;
@@ -1667,48 +1581,17 @@ function stripArtifacts(text) {
 function cleanText(text) {
   return stripArtifacts(text).trim();
 }
-/**
- * 上游「生成图片」的附件 URL 埋得很深。实测结构(2026-09,从真机浏览器抓取):
- *   ["rc_xxx",["\n\nhttp://googleusercontent.com/image_generation_content/0_621\n\n"],
- *     null,null,null,null,null,null,[1],null,null,null,
- *     [null,...,
- *       [[[[null,null,null,[null,1,"watermarked_img_123.jpg",
- *                          "https://lh3.googleusercontent.com/gg-dl/AAQ...",null]]]]]]]
- * 也就是说:同一数组里同时出现「*.(jpg|png|webp) 文件名」和「lh3.googleusercontent 图片链接」。
- */
 const IMG_NAME_RE = /\.(?:jpe?g|png|webp|gif|heic|avif)$/i;
 const IMG_URL_RE = /https?:\/\/(?:lh\d+\.)?googleusercontent\.com\/(?:gg|gg-dl|rd-ogw|rd-gg-dl)\//;
-function looksLikeImageUrl(s) {
-  return typeof s === "string" && s.length >= 24 && s.length <= 4000 && IMG_URL_RE.test(s);
-}
-function collectGenImages(node, out, depth) {
-  if (!node || out.length >= 8 || depth > 14) return;
-  if (Array.isArray(node)) {
-    let url = null;
-    let name = null;
-    for (const el of node) {
-      if (typeof el !== "string") continue;
-      if (!url && looksLikeImageUrl(el)) url = el;
-      else if (!name && IMG_NAME_RE.test(el) && el.length < 200 && !/^https?:/.test(el)) name = el;
-    }
-    if (url) {
-      if (!out.some((x) => x.url === url)) out.push({ url, name: name || "generated-image" });
-      return;
-    }
-    for (const el of node) collectGenImages(el, out, depth + 1);
-    return;
-  }
-  if (typeof node === "object") for (const k of Object.keys(node)) collectGenImages(node[k], out, depth + 1);
-}
 /**
- * 解析单行 `wrb.fr`,返回 { texts, images, meta }。
+ * 解析单行 `wrb.fr`,返回 { texts, meta }。
  * meta = [cid, rid, rcid] —— Gemini 的会话标识。下一轮把它放进 inner[2]
  * 就能接着同一个会话聊,不需要重传历史。槽位见 buildPayload() 的注释。
  * 注意:承载会话 id 的那几行往往没有内容体(inner[4] 为空),所以 meta
  * 必须在 inner[4] 判断之前先取出来。
  */
 function extractPartsFromLine(line) {
-  const empty = { texts: [], images: [], meta: null };
+  const empty = { texts: [], meta: null };
   if (!line.includes('"wrb.fr"') || line.length < 40) return empty;
   try {
     const arr = JSON.parse(line);
@@ -1717,7 +1600,7 @@ function extractPartsFromLine(line) {
     const inner = JSON.parse(innerStr);
     if (!Array.isArray(inner)) return empty;
     const meta = extractSessionMeta(inner);
-    if (!(inner.length > 4 && inner[4])) return { texts: [], images: [], meta };
+    if (!(inner.length > 4 && inner[4])) return { texts: [], meta };
     const texts = [];
     for (const part of inner[4]) {
       if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
@@ -1726,9 +1609,7 @@ function extractPartsFromLine(line) {
         }
       }
     }
-    const images = [];
-    collectGenImages(inner, images, 0);
-    return { texts, images, meta };
+    return { texts, meta };
   } catch (_) {
     return empty;
   }
@@ -1747,20 +1628,6 @@ function extractSessionMeta(inner) {
 /** 兼容旧签名:只要文本。 */
 function extractTextsFromLine(line) {
   return extractPartsFromLine(line).texts;
-}
-/** 把生成图片拼成 Markdown(OpenAI 兼容客户端基本都能渲染)。 */
-function withImages(text, images, cfg) {
-  if (!images || !images.length) return text || "";
-  const md = images.map((im) => `![${im.name || "generated image"}](${imageProxyUrl(cfg, im.url)})`).join("\n");
-  return text ? `${text}\n\n${md}` : md;
-}
-function extractMarkdownImageUrls(text) {
-  const out = [];
-  if (!text) return out;
-  const re = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
-  let m;
-  while ((m = re.exec(text)) !== null) if (!out.includes(m[1])) out.push(m[1]);
-  return out;
 }
 // 上游以 BardErrorInfo[code] 拒绝时直接抛错,不再静默返回空。
 // BardError 带 code,便于调用方识别 1060(IP 风控)做跨出口池重试。
@@ -1807,10 +1674,6 @@ function useSocket(cfg, attempt) {
   if (!cfg.alt_transport || attempt < 2) return base;
   return attempt % 2 === 0 ? !base : base;
 }
-// Gemini returns HTTP 200 with a natural-language "image creation isn't
-// available in your location" message when the egress country is unsuitable.
-// Treat that as a retryable upstream error so berrRetry() rotates DO region.
-const IMAGE_REGION_RE = /can(?:'|’)?t create (?:it|any).{0,180}(?:signed out|image creation|location)|image creation isn(?:'|’)?t available|image creation may not be available/i;
 function checkBardError(raw) {
   const m = /BardErrorInfo[^0-9]{0,20}(\d{3,5})/.exec(raw);
   if (m) throw new BardError(m[1]);
@@ -1819,20 +1682,16 @@ function extractResponseText(raw, cfg) {
   checkBardError(raw);
   let lastText = "";
   let meta = null;
-  const images = [];
   for (const line of raw.split("\n")) {
     const parsed = extractPartsFromLine(line);
     if (parsed.meta) meta = parsed.meta;
     for (const t of parsed.texts) {
       if (t.length > lastText.length) lastText = t;
     }
-    for (const im of parsed.images) {
-      if (!images.some((x) => x.url === im.url)) images.push(im);
-    }
   }
   // 回传给路由层,由它落库(下一轮拿它做续聊)。
   if (cfg && meta) { cfg._session_meta = meta; cfg._metaFresh = true; }
-  return withImages(cleanText(lastText), images, cfg);
+  return cleanText(lastText);
 }
 /** 非流式生成(带重试)。返回最终的响应文本。 */
 async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
@@ -1864,9 +1723,6 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
         });
       }
       const raw = await resp.text();
-      if (IMAGE_REGION_RE.test(raw)) {
-        throw new UpstreamHttpError(502, raw.slice(0, 400));
-      }
       const text = extractResponseText(raw, cfg);
       // 非 2xx / 机器人校验页:一律当成「出口不可信」,交给上层换出口重试
       if (!resp.ok) throw new UpstreamHttpError(resp.status, raw.slice(0, 400));
@@ -1948,17 +1804,9 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
       let buf = "";
       let prev = "";
       let started = false; // 是否已 yield 过非空内容(用于裁掉开头的空白)
-      const emittedImages = new Set();
       const consumeLine = function* (line) {
         const parsed = extractPartsFromLine(line);
         if (parsed.meta) { cfg._session_meta = parsed.meta; cfg._metaFresh = true; }
-        for (const im of parsed.images) {
-          if (emittedImages.has(im.url)) continue;
-          emittedImages.add(im.url);
-          const md = `![${im.name || "generated image"}](${imageProxyUrl(cfg, im.url)})`;
-          yield started ? `\n\n${md}` : md;
-          started = true;
-        }
         for (const t of parsed.texts) {
           // 跨重试一致性:若与已输出文本不构成前缀关系,说明重试换了内容,直接报错。
           if (t === emittedRawText || emittedRawText.startsWith(t)) continue;
@@ -1982,9 +1830,6 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
-        if (!yielded && IMAGE_REGION_RE.test(buf)) {
-          throw new UpstreamHttpError(502, buf.slice(-800));
-        }
         if (buf.includes("BardErrorInfo")) checkBardError(buf);
         let idx;
         while ((idx = buf.indexOf("\n")) >= 0) {
@@ -2447,11 +2292,6 @@ async function handleChat(req, cfg, request) {
           log(cfg, `chat stream produced no content -> ${note}`);
           chunk({ content: note }, null); // 让客户端看到原因,而非空白
         }
-        // 网页端拒绝出图时,用官方 API 补一张
-        if (acc) {
-          const imgUrl = await imageFallbackViaApi(cfg, cfg._env, promptBody || prompt, acc);
-          if (imgUrl) chunk({ content: `\n\n![generated image](${imgUrl})` }, null);
-        }
         await finishTurn(got, acc);
         chunk({}, "stop");
         // 流式响应头在开始时就固定了,新会话那时还没有 cid —— 用 SSE 注释回传。
@@ -2479,17 +2319,9 @@ async function handleChat(req, cfg, request) {
     log(cfg, "chat non-stream produced no content (empty upstream)");
     text = EMPTY_UPSTREAM_MSG; // 可见提示,避免客户端“无返回”
   }
-  // 网页端拒绝出图时,用官方 API 补一张(客户端无需改动)
-  if (text && !toolCalls) {
-    const imgUrl = await imageFallbackViaApi(cfg, cfg._env, promptBody || prompt, text);
-    if (imgUrl) text = `${text}\n\n![generated image](${imgUrl})`;
-  }
   await finishTurn(true, text);
   const msg = { role: "assistant", content: text || null };
   if (toolCalls) msg.tool_calls = toolCalls;
-  // 生成图片:正文里已经是 Markdown;再挂一份结构化 images[](兼容 Cherry Studio 之类的客户端)
-  const genImages = extractMarkdownImageUrls(text);
-  if (genImages.length) msg.images = genImages.map((u) => ({ type: "image_url", image_url: { url: u } }));
   const finish = toolCalls ? "tool_calls" : "stop";
   if (stream) {
     return sseResponse(async (write) => {
@@ -2518,7 +2350,6 @@ function clientIp(request) {
 // 每个 isolate 内的滑动窗口限流。Cloudflare 会在多个 isolate 间分担请求,
 // 因此它是近似限流,不依赖 KV/D1,避免每个 API 调用都增加一次存储写入。
 const RATE_LIMIT_STORE = new Map();
-const IMG_RATE_STORE = new Map();
 /** 通用滑动窗口计数。低频清理冷 key,防止 isolate 长生命周期内 Map 无限增长。 */
 function slidingLimit(store, clientIP, max, windowMs) {
   const now = Date.now();
@@ -2539,10 +2370,6 @@ function slidingLimit(store, clientIP, max, windowMs) {
 function checkRateLimit(clientIP, cfg) {
   if (!cfg || !cfg.rate_limit_enabled) return true;
   return slidingLimit(RATE_LIMIT_STORE, clientIP, cfg.rate_limit_max, Math.max(1, cfg.rate_limit_window) * 1000);
-}
-/** /img 是公开端点(不带 API key),单独限流,防止被刷爆 R2 读次数。 */
-function checkImgRate(clientIP, cfg) {
-  return slidingLimit(IMG_RATE_STORE, clientIP, cfg.image_proxy_rate_max || 600, 60000);
 }
 // POST /v1/responses(Codex CLI 用)
 async function handleResponses(req, cfg, request) {
@@ -2921,7 +2748,7 @@ async function refreshSession(cfg, origin) {
   };
 }
 // ════════════════════════════════════════════════════════════════════════════
-//  会话记忆(服务端续聊)+ 长期记忆 + 生成图片中转
+//  会话记忆(服务端续聊)+ 长期记忆
 //
 //  设计要点:
 //   · 会话:把 [cid, rid, rcid] 存进 D1,下一轮塞回 inner[2],只发增量。
@@ -2929,11 +2756,10 @@ async function refreshSession(cfg, origin) {
 //     对得上就只把「新增的那几条」发上去,对不上就当新会话(不会串话)。
 //   · 记忆:跨会话的事实,存 D1,开新会话时注入 prompt;续聊不重复注入
 //     (Gemini 侧上下文里已经有了)。
-//   · 图片:上游直链改写成 <PUBLIC_ORIGIN>/img/<key>,自己回源 + 缓存。
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * 128 位同步哈希。必须是同步的 —— 图片 URL 重写发生在拼装文本的同步路径里,
+ * 128 位同步哈希。必须是同步的 —— 指纹校验发生在拼装文本的同步路径里,
  * 而 crypto.subtle.digest 是异步的。仅用于指纹 / 缓存键,不做安全用途。
  */
 function syncHash(str) {
@@ -2976,11 +2802,9 @@ const DDL = [
   "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, scope TEXT NOT NULL, content TEXT NOT NULL, " +
     "source TEXT, created_ts INTEGER, updated_ts INTEGER)",
   "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, updated_ts)",
-  "CREATE TABLE IF NOT EXISTS img_map (hash TEXT PRIMARY KEY, url TEXT NOT NULL, ts INTEGER)",
-  "CREATE TABLE IF NOT EXISTS img_budget (k TEXT PRIMARY KEY, v INTEGER DEFAULT 0)",
   "CREATE TABLE IF NOT EXISTS egress_stats (id TEXT PRIMARY KEY, kind TEXT, target TEXT, label TEXT, " +
-    "text_status TEXT, image_status TEXT, latency_ms INTEGER, runs INTEGER DEFAULT 0, ok_runs INTEGER DEFAULT 0, " +
-    "image_ok_runs INTEGER DEFAULT 0, fails INTEGER DEFAULT 0, score REAL DEFAULT 0, detail TEXT, updated_ts INTEGER)",
+    "text_status TEXT, latency_ms INTEGER, runs INTEGER DEFAULT 0, ok_runs INTEGER DEFAULT 0, " +
+    "fails INTEGER DEFAULT 0, score REAL DEFAULT 0, detail TEXT, updated_ts INTEGER)",
   // 出口池存 D1 而不是 KV:KV 是最终一致的,写完立刻读会读不到,前端会以为没保存上。
   "CREATE TABLE IF NOT EXISTS egress_pool (id TEXT PRIMARY KEY, kind TEXT, target TEXT, label TEXT, ord INTEGER)",
   "CREATE TABLE IF NOT EXISTS egress_settings (k TEXT PRIMARY KEY, v TEXT)",
@@ -3215,9 +3039,8 @@ async function prepareSession(cfg, request, req, messages, modelId) {
   return { sid, sess, explicit: key.explicit, source: key.source, cid: key.cid || "", model: modelId, plan, deltaOK };
 }
 
-/** 一轮结束后:落库会话 + 把本轮图片 URL→key 映射写进 D1。 */
+/** 一轮结束后落库会话状态(下一轮靠它做续聊)。 */
 async function endTurn(cfg, sctx, ok, messages, modelId) {
-  try { await flushImageMap(cfg); } catch (_) { /* ignore */ }
   if (!ok || !sctx || !sctx.sid) return;
   const env = cfg._env;
   if (!env || (!env.DB && !env.STATE)) return;
@@ -3301,301 +3124,6 @@ async function memoryBlock(cfg, env, scope) {
   }
   if (!lines.length) return "";
   return "[长期记忆 · 请在后续回答中遵循]\n" + lines.join("\n") + "\n[/长期记忆]";
-}
-
-// ── 生成图片中转 ───────────────────────────────────────────────────────────
-// 上游直链(googleusercontent.com,而且 gg-dl 带签名会过期)用户那边往往加载
-// 不出来。这里改写成自家域名,自己回源并缓存到 R2 + 边缘。
-const IMG_KEY_RE = /^[0-9a-f]{16,64}$/;
-function imgKeyOf(cfg, url) {
-  return syncHash((cfg && cfg.public_origin ? cfg.public_origin : "") + "|" + url).slice(0, 24);
-}
-/** 同步路径:把 googleusercontent 直链换成 <PUBLIC_ORIGIN>/img/<key>。 */
-function imageProxyUrl(cfg, url) {
-  if (!cfg || cfg.image_proxy === false) return url;
-  if (!url || !IMG_URL_RE.test(url)) return url;
-  const env = cfg._env;
-  if (!env || (!env.DB && !env.FILECACHE)) return url;
-  if (!cfg.public_origin) return url; // 没配对外域名就保持直链,免得给个打不开的地址
-  const key = imgKeyOf(cfg, url);
-  if (!cfg._imgPending) cfg._imgPending = new Map();
-  if (!cfg._imgPending.has(key)) cfg._imgPending.set(key, url);
-  return cfg.public_origin + "/img/" + key;
-}
-/** 把本轮 URL→key 映射落进 D1(/img/<key> 靠它反查原图)。 */
-async function flushImageMap(cfg) {
-  const pend = cfg && cfg._imgPending;
-  if (!pend || !pend.size) return;
-  cfg._imgPending = null;
-  const env = cfg._env;
-  if (!env || !env.DB) return;
-  try {
-    await ensureSchema(env);
-    const ts = Date.now();
-    const stmts = [];
-    for (const [k, u] of pend) {
-      stmts.push(env.DB.prepare(
-        "INSERT INTO img_map (hash, url, ts) VALUES (?1, ?2, ?3) ON CONFLICT(hash) DO UPDATE SET url = excluded.url, ts = excluded.ts"
-      ).bind(k, u, ts));
-    }
-    if (stmts.length) await env.DB.batch(stmts);
-  } catch (e) { log(cfg, `img_map 写入失败(不影响出图): ${e}`); }
-}
-function monthKey() {
-  const d = new Date();
-  return "b:" + d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0");
-}
-/** R2 月度写入预算:超额就不再落 R2(图照常显示,只是不缓存)。 */
-async function r2BudgetAllow(cfg, env, size) {
-  const cap = Number(cfg.image_r2_monthly_max_bytes || 0);
-  if (!cap) return false;
-  if (!env.DB) return true;
-  try {
-    const row = await env.DB.prepare("SELECT v FROM img_budget WHERE k = ?1").bind(monthKey()).first();
-    return Number((row && row.v) || 0) + size <= cap;
-  } catch (_) { return true; }
-}
-async function r2BytesAdd(env, size) {
-  if (!env || !env.DB) return;
-  try {
-    await env.DB.prepare(
-      "INSERT INTO img_budget (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = v + excluded.v"
-    ).bind(monthKey(), size).run();
-  } catch (_) { /* ignore */ }
-}
-async function storeImageR2(cfg, env, key, bytes, mime) {
-  if (!env || !env.FILECACHE) return false;
-  if (cfg.image_r2_store === false) return false;
-  if (bytes.byteLength > Number(cfg.image_object_max_bytes || 12582912)) return false;
-  if (!(await r2BudgetAllow(cfg, env, bytes.byteLength))) {
-    log(cfg, "R2 图片月度预算已用尽,本次只走边缘缓存");
-    return false;
-  }
-  try {
-    await env.FILECACHE.put("img/" + key, bytes, {
-      httpMetadata: { contentType: mime || "image/png", cacheControl: `public, max-age=${cfg.image_cache_ttl_sec || 604800}` },
-    });
-    await r2BytesAdd(env, bytes.byteLength);
-    return true;
-  } catch (e) { log(cfg, `R2 写入失败: ${e}`); return false; }
-}
-const IMG_UPSTREAM_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-  "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-  "Referer": "https://gemini.google.com/",
-};
-/**
- * GET /img/<key> —— 公开端点。<img> 标签发不出 Authorization 头,所以用
- * 「不可猜的 key」当凭据;key 只由 googleusercontent 白名单 URL 生成,
- * 不构成任意 URL 代理(SSRF)。
- */
-async function handleImageProxy(key, request, cfg, env) {
-  const base = {
-    ...corsHeaders(),
-    "Cache-Control": `public, max-age=${Math.max(60, cfg.image_cache_ttl_sec || 604800)}`,
-    "X-Content-Type-Options": "nosniff",
-  };
-  if (!IMG_KEY_RE.test(String(key || ""))) return new Response("bad image key", { status: 400, headers: base });
-  const cache = (typeof caches !== "undefined" && caches && caches.default) ? caches.default : null;
-  const cacheKey = new Request(new URL(request.url).toString(), { method: "GET" });
-  if (cache) { try { const hit = await cache.match(cacheKey); if (hit) return hit; } catch (_) { /* ignore */ } }
-
-  // ① R2(持久层)
-  if (env.FILECACHE) {
-    try {
-      const obj = await env.FILECACHE.get("img/" + key);
-      if (obj) {
-        const mime = (obj.httpMetadata && obj.httpMetadata.contentType) || "image/png";
-        const res = new Response(obj.body, { status: 200, headers: { ...base, "Content-Type": mime } });
-        if (cache) { try { await cache.put(cacheKey, res.clone()); } catch (_) { /* ignore */ } }
-        return res;
-      }
-    } catch (_) { /* ignore */ }
-  }
-
-  // ② D1 反查原图(丢了映射还能用 ?s=<base64url> 兜底)
-  let src = "";
-  if (env.DB) {
-    try {
-      await ensureSchema(env);
-      const row = await env.DB.prepare("SELECT url FROM img_map WHERE hash = ?1").bind(key).first();
-      src = (row && row.url) || "";
-    } catch (_) { /* ignore */ }
-  }
-  if (!src) {
-    const q = new URL(request.url).searchParams.get("s");
-    if (q) { try { const d = b64urlDecode(q); if (IMG_URL_RE.test(d)) src = d; } catch (_) { /* ignore */ } }
-  }
-  if (!src || !IMG_URL_RE.test(src)) return new Response("image not found", { status: 404, headers: base });
-
-  // ③ 回源 + 回填
-  let up;
-  try {
-    up = await fetch(src, { headers: IMG_UPSTREAM_HEADERS, redirect: "follow" });
-  } catch (e) {
-    return new Response("upstream fetch failed: " + String((e && e.message) || e), { status: 502, headers: base });
-  }
-  if (!up.ok) return new Response("upstream " + up.status, { status: 502, headers: base });
-  const ctype = String(up.headers.get("content-type") || "image/png").split(";")[0].trim();
-  if (!ctype.startsWith("image/")) return new Response("upstream is not an image", { status: 502, headers: base });
-  const bytes = new Uint8Array(await up.arrayBuffer());
-  if (!bytes.byteLength) return new Response("empty upstream body", { status: 502, headers: base });
-  const res = new Response(bytes, { status: 200, headers: { ...base, "Content-Type": ctype, "Content-Length": String(bytes.byteLength) } });
-  if (cache) { try { await cache.put(cacheKey, res.clone()); } catch (_) { /* ignore */ } }
-  try { await storeImageR2(cfg, env, key, bytes, ctype); } catch (_) { /* ignore */ }
-  return res;
-}
-
-// ── 官方 Gemini API 出图 ───────────────────────────────────────────────────
-const OFFICIAL_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
-/**
- * 用官方 Gemini API 生成图片。返回 { bytes, mime }。
- * 这是「网页端出图被指纹卡住」的补充通道:走正规 API,没有客户端指纹校验。
- */
-async function officialImageGenerate(cfg, prompt, opts) {
-  const key = cfg && cfg.gemini_api_key;
-  if (!key) throw new Error("GEMINI_API_KEY 未配置,无法使用官方出图通道");
-  const model = (opts && opts.model) || cfg.gemini_image_model || "gemini-3.1-flash-image";
-  const url = `${OFFICIAL_API_BASE}/models/${encodeURIComponent(model)}:generateContent`;
-  const payload = {
-    contents: [{ role: "user", parts: [{ text: String(prompt || "").slice(0, 4000) }] }],
-  };
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: timeoutSignal(120000),
-  });
-  const text = await r.text();
-  if (!r.ok) {
-    throw new Error(`官方 API ${r.status}: ${text.slice(0, 1200)}`);
-  }
-  let j;
-  try { j = JSON.parse(text); } catch (_) { throw new Error("官方 API 返回非 JSON: " + text.slice(0, 200)); }
-  const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
-  for (const p of parts) {
-    const inline = p.inlineData || p.inline_data;
-    if (inline && inline.data) {
-      const mime = inline.mimeType || inline.mime_type || "image/png";
-      return { bytes: base64ToBytes(inline.data), mime };
-    }
-  }
-  const reason = (j.candidates && j.candidates[0] && j.candidates[0].finishReason) || "";
-  const said = parts.map((p) => p.text || "").join(" ").trim();
-  throw new Error("官方 API 未返回图片" + (reason ? ` (finishReason=${reason})` : "") + (said ? ": " + said.slice(0, 200) : ""));
-}
-/** 把生成的图片字节存进 R2(键沿用 img/<key>),返回可对外访问的 URL。 */
-async function publishImageBytes(cfg, env, bytes, mime, seed) {
-  const key = syncHash(String(seed || "") + "|" + bytes.byteLength + "|" + Date.now()).slice(0, 24);
-  if (env && env.FILECACHE) {
-    try {
-      await env.FILECACHE.put("img/" + key, bytes, {
-        httpMetadata: { contentType: mime || "image/png", cacheControl: `public, max-age=${cfg.image_cache_ttl_sec || 604800}` },
-      });
-    } catch (e) { log(cfg, `官方出图写 R2 失败: ${e}`); }
-  }
-  const origin = cfg.public_origin || "";
-  return origin ? `${origin}/img/${key}` : "";
-}
-/**
- * 官方 API 诊断:列出该 key 可用的模型(不消耗生成额度),或试跑一次生成。
- * 用来在配 key 前先看清额度/可用性。
- */
-async function handleOfficialDiag(req, cfg) {
-  const key = cfg && cfg.gemini_api_key;
-  if (!key) return jsonResponse({ error: { message: "GEMINI_API_KEY 未配置" } }, 503);
-  const action = String(req.action || "models").toLowerCase();
-  if (action === "models") {
-    try {
-      const r = await fetch(`${OFFICIAL_API_BASE}/models?pageSize=200`, {
-        headers: { "x-goog-api-key": key }, signal: timeoutSignal(30000),
-      });
-      const text = await r.text();
-      if (!r.ok) return jsonResponse({ ok: false, status: r.status, body: text.slice(0, 1500) }, 200);
-      let j;
-      try { j = JSON.parse(text); } catch (_) { return jsonResponse({ ok: false, body: text.slice(0, 500) }, 200); }
-      const all = (j.models || []).map((m) => ({
-        name: String(m.name || "").replace(/^models\//, ""),
-        methods: m.supportedGenerationMethods || [],
-      }));
-      const imageish = all.filter((m) => /image/i.test(m.name));
-      return jsonResponse({
-        ok: true, total: all.length,
-        image_models: imageish,
-        configured_model_available: all.some((m) => m.name === cfg.gemini_image_model),
-        sample: all.slice(0, 40).map((m) => m.name),
-      });
-    } catch (e) {
-      return jsonResponse({ ok: false, error: String((e && e.message) || e) }, 200);
-    }
-  }
-  if (action === "generate") {
-    const model = String(req.model || cfg.gemini_image_model);
-    const prompt = String(req.prompt || "a red apple");
-    const t0 = Date.now();
-    try {
-      const r = await fetch(`${OFFICIAL_API_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
-        method: "POST",
-        headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
-        signal: timeoutSignal(120000),
-      });
-      const text = await r.text();
-      let got = 0, mime = "";
-      try {
-        const j = JSON.parse(text);
-        const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
-        for (const p of parts) {
-          const inl = p.inlineData || p.inline_data;
-          if (inl && inl.data) { got++; mime = inl.mimeType || inl.mime_type || ""; }
-        }
-      } catch (_) { /* 不是 JSON */ }
-      return jsonResponse({ ok: r.ok, status: r.status, ms: Date.now() - t0, model, images: got, mime, body: r.ok && got ? "" : text.slice(0, 1500) }, 200);
-    } catch (e) {
-      return jsonResponse({ ok: false, model, ms: Date.now() - t0, error: String((e && e.message) || e) }, 200);
-    }
-  }
-  return jsonResponse({ error: { message: "action 需为 models 或 generate" } }, 400);
-}
-/** POST /v1/images/generations —— OpenAI 兼容的图片生成端点。 */
-async function handleImagesGenerations(req, cfg, env) {
-  if (!cfg.gemini_api_key) {
-    return jsonResponse({
-      error: { message: "图片生成需要配置 GEMINI_API_KEY(网页端出图受客户端指纹限制,见 README)", type: "image_backend_unavailable" },
-    }, 503);
-  }
-  const prompt = String(req.prompt || "").trim();
-  if (!prompt) return jsonResponse({ error: { message: "prompt is required" } }, 400);
-  const n = Math.min(Math.max(Number(req.n) || 1, 1), 4);
-  const out = [];
-  try {
-    for (let i = 0; i < n; i++) {
-      const { bytes, mime } = await officialImageGenerate(cfg, prompt, { model: req.model && !/^gemini-3\.(7|6|5|8)-flash/.test(req.model) ? req.model : null });
-      const url = await publishImageBytes(cfg, env, bytes, mime, prompt + "#" + i);
-      out.push(url ? { url } : { b64_json: bytesToBase64(bytes), revised_prompt: prompt });
-    }
-  } catch (e) {
-    return jsonResponse({ error: { message: String((e && e.message) || e) } }, 502);
-  }
-  return jsonResponse({ created: nowSec(), data: out });
-}
-/**
- * 聊天里被网页端拒绝出图时的回退:改用官方 API 生成,把图片接到回复里。
- * 找不到图片意图就原样返回,不改变行为。
- */
-async function imageFallbackViaApi(cfg, env, prompt, text) {
-  if (!cfg.gemini_api_key || cfg.image_fallback_api === false) return null;
-  if (!IMAGE_REGION_RE.test(String(text || ""))) return null;
-  try {
-    const { bytes, mime } = await officialImageGenerate(cfg, prompt);
-    const url = await publishImageBytes(cfg, env, bytes, mime, prompt);
-    if (!url) return null;
-    log(cfg, "网页端拒绝出图,已用官方 API 回退成功");
-    return url;
-  } catch (e) {
-    log(cfg, `官方 API 出图回退失败: ${(e && e.message) || e}`);
-    return null;
-  }
 }
 
 // ── 记忆 HTTP 接口 ─────────────────────────────────────────────────────────
@@ -3746,14 +3274,6 @@ export default {
     if (method === "GET" && path === "/" && String(request.headers.get("accept") || "").indexOf("text/html") >= 0) {
       return uiResponse();
     }
-    // 生成图片中转:公开端点 —— <img> 标签发不出 Authorization 头,
-    // 所以以「不可猜的 key」当凭据,并单独限流防刷。
-    if (method === "GET" && path.indexOf("/img/") === 0) {
-      if (!checkImgRate(cfg.client_ip, cfg)) {
-        return new Response("too many requests", { status: 429, headers: corsHeaders() });
-      }
-      return await handleImageProxy(path.slice(5), request, cfg, env);
-    }
     // 出口池按纯净度评分排序(缓存 60s,不给每次请求都加一次存储读)。
     // 池为空(没配任何出口)时保持旧行为。
     cfg._egressOrder = await egressOrderCached(cfg, env);
@@ -3829,11 +3349,7 @@ export default {
             session_ttl_sec: cfg.session_ttl_sec,
             memory: !!cfg.memory_enabled,
             memory_auto_extract: !!cfg.memory_auto_extract,
-            image_proxy: !!cfg.image_proxy,
-            public_origin: cfg.public_origin || "",
             r2_bound: !!env.FILECACHE,
-            image_api_fallback: !!cfg.gemini_api_key && cfg.image_fallback_api !== false,
-            image_api_model: cfg.gemini_api_key ? cfg.gemini_image_model : "",
             egress_pool: (cfg._egressOrder || []).map((e) => e.id),
             egress_force: cfg.egress_force || "",
             ts: Date.now(),
@@ -3896,10 +3412,6 @@ export default {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await berrRetry(() => handleChat(req, cfg, request));
         }
-        if (path === "/v1/images/generations") {
-          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
-          return await handleImagesGenerations(req, cfg, env);
-        }
         if (path === "/v1/responses") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await berrRetry(() => handleResponses(req, cfg, request));
@@ -3948,11 +3460,10 @@ export default {
       if (live.alive || patch.cookie) await saveState(env, patch);
       log(cfg, `cron refresh: status=${live.status} alive=${live.alive} set-cookie=${live.setCookieCount} rotated=${live.rotated}`);
       // 顺带跑一轮出口纯净度测试(每 6h 一次,和 cron 同频)。
-      // 图片探针会真的调一次生成,所以受 EGRESS_PROBE_IMAGE 控制。
       try {
         cfg._egressOrder = await egressOrderCached(cfg, env);
-        const results = await runEgressTests(cfg, env, null, { image: !!cfg.egress_probe_image });
-        log(cfg, "egress probe: " + results.map((r) => `${r.label || r.id}=${r.text_status}/${r.image_status}:${r.score}`).join(" "));
+        const results = await runEgressTests(cfg, env, null);
+        log(cfg, "egress probe: " + results.map((r) => `${r.label || r.id}=${r.text_status}:${r.score}`).join(" "));
       } catch (e) {
         log(cfg, `egress probe failed: ${(e && e.message) || e}`);
       }
@@ -4119,11 +3630,9 @@ function egressRow(entry, stat, forced) {
     target: entry.kind === "proxy" ? maskProxySpec(entry.target) : (entry.target || entry.kind),
     forced: forced === entry.id || forced === entry.target,
     text_status: s.text_status || "",
-    image_status: s.image_status || "",
     latency_ms: Number(s.latency_ms || 0),
     score: Number(s.score || 0),
     runs: Number(s.runs || 0),
-    image_ok_runs: Number(s.image_ok_runs || 0),
     updated_ts: Number(s.updated_ts || 0),
     detail: s.detail || "",
   };
@@ -4145,7 +3654,6 @@ async function handleAdminEgress(req, cfg, env, url, method) {
     return jsonResponse({
       object: "list",
       forced,
-      probe_image: settings.probe_image === undefined ? !!cfg.egress_probe_image : settings.probe_image === "1",
       order,
       source: stored ? "stored" : "default",
       data: rows,
@@ -4156,11 +3664,7 @@ async function handleAdminEgress(req, cfg, env, url, method) {
   const action = String(body.action || "").toLowerCase();
   if (action === "test") {
     const ids = Array.isArray(body.ids) ? body.ids : null;
-    const settings = await loadEgressSettings(env);
-    const withImage = body.image === undefined
-      ? (settings.probe_image === undefined ? !!cfg.egress_probe_image : settings.probe_image === "1")
-      : !!body.image;
-    const results = await runEgressTests(cfg, env, ids, { image: withImage });
+    const results = await runEgressTests(cfg, env, ids);
     _egressCache = { data: null, ts: 0 };
     return jsonResponse({ ok: true, tested: results.length, results });
   }
@@ -4175,10 +3679,6 @@ async function handleAdminEgress(req, cfg, env, url, method) {
     await saveEgressSetting(env, "force", id);
     _egressCache = { data: null, ts: 0 };
     return jsonResponse({ ok: true, forced: id });
-  }
-  if (action === "probe_image") {
-    await saveEgressSetting(env, "probe_image", body.enabled ? "1" : "");
-    return jsonResponse({ ok: true, probe_image: !!body.enabled });
   }
   return jsonResponse({ error: { message: "unknown action" } }, 400);
 }
@@ -4367,7 +3867,7 @@ async function handleEgressDiag(req, cfg) {
 // 导出给本地测试用(Workers 运行时会忽略)。
 export {
   MODELS, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
-  extractTextsFromLine, extractPartsFromLine, extractResponseText, withImages, extractMarkdownImageUrls, collectGenImages, generate, generateStream,
+  extractTextsFromLine, extractPartsFromLine, extractResponseText, generate, generateStream,
   messagesToPrompt, parseToolCalls, googleContentsToPrompt, parseGoogleFunctionCalls,
   makeSapisidHash, parseImageUrl, decodeDataUrl, normalizeMimeType, detectImageMime, imageFromPart,
   isPrivateIpv4, isPrivateHostname, validateImageUrl, assertPublicImageHost, fetchRemoteImage, getPageTokens, uploadImage, resolveImages,
@@ -4377,10 +3877,9 @@ export {
   UpstreamHttpError, isUpstreamHttpError, isRetryableUpstream, retryDelayMs, useSocket,
   fileRefCacheKey, pickFingerprint, handleRawDebug,
   syncHash, extractSessionMeta, sessionKey, planTurn, messageHash, renderSlice, renderMessageParts,
-  memoryBlock, memoryList, memoryAdd, memoryScope, imageProxyUrl, imgKeyOf, handleImageProxy,
+  memoryBlock, memoryList, memoryAdd, memoryScope,
   sseResponse, extractEgressLocation,
   egressCooling, markEgressBad, markEgressGood, upstreamErrorMessage,
-  officialImageGenerate, publishImageBytes, imageFallbackViaApi, handleImagesGenerations,
   parseEgressSpec, entryToSpec, defaultEgressPool, scoreEgress, orderEgress, maskProxySpec, socks5Connect, streamSource,
   httpOverSocket, proxyHttpFetch, applyEgressAttempt,
 };

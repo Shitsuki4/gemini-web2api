@@ -11,17 +11,12 @@
 - **Responses API**: `/v1/responses`(完整事件序列,兼容 Codex CLI 等严格客户端)
 - **Google 原生 API**: `/v1beta/models/{model}:generateContent` / `:streamGenerateContent`
 - **工具调用**: Function Calling(OpenAI 格式);大工具列表自动裁剪参数防静默截断
-- **图片生成(两条通道)**:
-  - **网页端**:逆向 `StreamGenerate` 出图。**实测受「客户端 TLS/HTTP2 指纹」限制** —— 同一个 payload、同一个账号、同一个出口 IP,浏览器能出图、curl/Worker 不能(见下节)。所以这条通道在实践中出不了图。
-  - **官方 API 回退**(推荐):配置 `GEMINI_API_KEY` 后,① 开放 OpenAI 兼容的 `POST /v1/images/generations`;② 聊天里被「无法创建图片」拒绝时**自动改走官方 API 补一张**,现有客户端无需任何改动
-- **图片自建中转**: 生成图链接改写成 `<PUBLIC_ORIGIN>/img/<key>`,由本 worker 回源并按 key 缓存(Cloudflare 边缘缓存 + R2)。不再把 `googleusercontent.com` 直链交给客户端 —— 那个域名部分地区被墙,且 `gg-dl` 是带签名会过期的下载链
 - **服务端会话续聊(会话 = Gemini 会话 id)**: D1 `chat_sessions` 存着 Gemini 的会话标识(`cid`/`rid`/`rcid`),下一轮回填 `inner[2]`,**只把新增内容发上去**,历史留在 Gemini 侧
   - 响应会回传真实 cid:非流式看响应头 `X-Gemini-Cid`,流式看 SSE 注释 `: gemini-cid=c_…`(OpenAI 客户端会忽略 `:` 开头的行)。把这个 cid 当会话 id 传回来(`X-Session-Id: c_…` 或 body 的 `session_id`),**下一轮只发那一条新消息即可,无需携带历史** —— 这时一个会话就等价于 `gemini.google.com/app/<cid>`
   - **点名 cid 时以上游会话为准**:即使本地历史对不上(客户端截断了旧消息、每轮都换 system prompt 之类)也照样续,只发最后一条用户消息 —— 不会退回「重发全量」,长对话因此不会发几轮就爆
   - 不给会话 id 时,按「API Key + 首条用户消息」隐式归组,并用「条数 + 渲染指纹」校验前缀;对不上就当新会话(保守,不串话)。`X-Session-Mode: delta` 可显式声明「我只发增量」
 - **跨会话长期记忆**: 事实存 D1,开新会话时注入 prompt;`/v1/memories` 增删查,`X-Memory-Scope` 做分组隔离,可选每轮自动提炼
-- **R2 免费额度保护**: 单张体积上限 + 月度写入预算,超出后不再写 R2(图片仍能正常显示,只是不缓存);桶上配 7 天生命周期规则自动回收
-- **可切换出口池 + 纯净度排序**: 出口支持三种写法(`direct` / `colo:weur` Cloudflare 机房 / `socks5://`·`http://` 外部代理),每个出口实测打分后按分数择优使用,失败自动轮换。代理隧道建好后一律 `startTls` 到目标域名,不把 cookie 明文交给代理
+- **可切换出口池 + 纯净度排序**: 出口支持四种写法(`direct` / `colo:weur` Cloudflare 机房 / `socks5://`·`http://` 外部代理 / `relay:host:port` 盲转发中继),每个出口实测打分后按分数择优使用,失败自动轮换。代理隧道建好后一律 `startTls` 到目标域名,不把 cookie 明文交给代理
 - **网页控制台**: `/ui`(根路径对浏览器自动返回它),含对话、会话管理、长期记忆、出口池测试与状态面板
 - **多模型**: `gemini-3.8-flash`(默认)、`gemini-3.8-flash-thinking`(扩展思考)、`gemini-3.1-pro`、`gemini-auto`、`gemini-flash-lite` 等;旧版本名(3.7/3.6/3.5)保留为指向 3.8 的别名
 - **思考深度**: 模型名加 `@think=N` 后缀调节
@@ -36,13 +31,13 @@
 - **错误透传**: `BardErrorInfo[code]` 拒绝时返回明确错误,不再静默空白
 - **流式可靠性**: 重试时校验已输出前缀一致,防止内容错乱
 - **出口 IP 规避**: 上游请求优先走 `cloudflare:sockets` 裸 TCP,绕开 fetch 的 429 限流
-- **区域出口池**: `DO_EGRESS` + `EgressRelay` Durable Object 按 `weur/eeur/wnam` 等 locationHint 轮换出口机房(图片生成在香港机房不可用)
-- **1060/429/图片地区重试**: `BardErrorInfo[1060]`、429、以及"image creation isn't available in your location"都会触发换出口重试
+- **区域出口池**: `DO_EGRESS` + `EgressRelay` Durable Object 按 `weur/eeur/wnam` 等 locationHint 轮换出口机房
+- **1060/429 自动换出口重试**: `BardErrorInfo[1060]` 与 429 都会触发换出口重试;被上游拒的出口冷却 90s 并跳过,不会把重试预算耗在同一个坏出口上
 - **客户端 IP 日志**: 访问日志携带 `cf-connecting-ip`
 
 ## 出口池与纯净度排序
 
-Google 会按**出口 IP** 区别对待请求:有的直接 `BardErrorInfo[1060]`,有的 429/reCAPTCHA,图片生成更是普遍被拒。出口池把「出口」抽象成可切换、可打分、可排序的一等公民。
+Google 会按**出口 IP** 区别对待请求:有的直接 `BardErrorInfo[1060]`,有的 429/reCAPTCHA。出口池把「出口」抽象成可切换、可打分、可排序的一等公民。
 
 四种出口:
 
@@ -58,31 +53,13 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 类服务的工作方式。
 
 - 配置走 `EGRESS_POOL`,运行时可经 `/admin/egress` 热改(存 D1,强一致)。
-- **打分**:文本通 40 / 通但空 10 / 429(能连上、只是被限流)4 / 5xx 2 / 1060 或超时 0;能出图再 **+50**(图片才是真正卡人的指标);按延迟加 0~10 分。
+- **打分**:文本通 40 / 通但空 10 / 429(能连上、只是被限流)4 / 5xx 2 / 1060 或超时 0;再按延迟加 0~10 分。
 - 请求时按分数从高到低轮换,失败自动换下一个;`EGRESS_FORCE` 或前端「强制」可钉死某个出口。
 - cron 每 6h 自动跑一轮测试,前端也能手动触发。
 
 **代理隧道的实现**:`cloudflare:sockets` 的 `connect()` 建 TCP → HTTP 代理发 `CONNECT`(带 `Proxy-Authorization: Basic`)/ SOCKS5 做握手(支持用户名密码与域名 ATYP)→ `socket.startTls()` 到目标域名 → 复用同一套 HTTP/1.1 收发逻辑。隧道建成前不发送任何业务数据,所以 Gemini 的 cookie 不会明文暴露给代理。
 
-> **实测结论(2026-09-26,决定性)**:图片生成的门槛是**客户端 TLS/HTTP2 指纹**,不是出口 IP、也不是 payload。
->
-> 三行对照(同一账号、同一台湾住宅出口):
->
-> | 组合 | 结果 |
-> |---|---|
-> | 我们的 payload + **curl** | ❌ 被拒 |
-> | 浏览器抓的真实 payload + **curl**(**1 秒内**重放) | ❌ 被拒 |
-> | **我们的 payload + 浏览器内部 fetch** | ✅ **出图** |
->
-> 同一个 payload、同一个出口,只有客户端不同。⇒ Google 对图片生成这一敏感能力做了**客户端指纹校验**(防自动化),文本生成不校验(所以 Worker 一直能用)。
->
-> **因为 Workers 的两条出网路径(`fetch()` 与 `connect()+startTls()`)都是 Cloudflare 自己的 TLS 栈、无法伪装 Chrome,所以 Worker 自身出不了图。**
->
-> 已系统性排除的方向(别再重复):出口 IP / Cloudflare 机房 / payload 字段(`[1][2][3][4][6][17][30][41][49][68][71]` 全搬过来仍不出图) / 请求头(含能力标志 `16`) / `f.sid`/`SNlM0e` 陈旧 / 自造 cid / `inner[3]`·`inner[4]` 时效 token(**1 秒内**重放仍失败) / 账号资格(cookie 与浏览器**逐项相同**)。
->
-> ⇒ 结论:**图片生成改走官方 API**(见上一节)。这是唯一不依赖浏览器指纹、且仍能在同一个 Worker 内完成的方案。
-
-> **出口池实测**:Cloudflare 只能把我们放在**美/欧/新西兰**(wnam=California、enam=US、sam=Illinois、me=Austria、weur=Netherlands、eeur=Warsaw、oc=Auckland),文本可用、图片全被拒;`apac`/`afr` 直接 302 到 `google.com/sorry`(异常流量验证码)。出口池骨架已就绪,**接一个可用代理即可**。
+> **出口池实测**:Cloudflare 只能把我们放在**美/欧/新西兰**(wnam=California、enam=US、sam=Illinois、me=Austria、weur=Netherlands、eeur=Warsaw、oc=Auckland);`apac`/`afr` 直接 302 到 `google.com/sorry`(异常流量验证码)。出口池骨架已就绪,接一个可用代理即可。
 >
 > 另外两个与机制相关的实测:`socket.startTls()` 必须以 `secureTransport: "starttls"` 建连(否则报 "must be set to 'starttls'");`https://` 代理不支持 —— Workers 的 socket 不能在已加密的连接上再 `startTls`,无法做双层 TLS。
 >
@@ -100,12 +77,10 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions(支持 `stream`) |
 | `POST /v1/responses` | OpenAI Responses API |
-| `POST /v1/images/generations` | OpenAI 兼容图片生成(需 `GEMINI_API_KEY`,走官方 API;未配置时返回 503 并说明原因) |
 | `GET /v1/models` | 模型列表 |
 | `POST /v1beta/models/{model}:generateContent` | Google 原生(非流式) |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Google 原生(流式,`?alt=sse`) |
 | `GET /health` · `GET /healthz` | 健康检查(版本、模型数、cookie 状态、出口提示、限流参数) |
-| `GET /img/<key>` | 生成图片中转(**公开**,不带鉴权 —— `<img>` 标签发不出 Authorization 头;以不可猜的 key 当凭据,只允许 `googleusercontent.com` 白名单) |
 | `GET /v1/memories` | 列出长期记忆(`X-Memory-Scope` 指定分组) |
 | `POST /v1/memories` | 新增记忆:`{"memories":["..."]}` 或 `{"content":"..."}` |
 | `DELETE /v1/memories` | 删除:`{"id":"..."}` 删一条,空 body 清空该 scope |
@@ -113,7 +88,7 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 | `POST /admin/cookie` | 热更新 cookie/state(写入 KV) |
 | `GET /ui` | 网页控制台(根路径 `GET /` 在 `Accept: text/html` 时也返回它;探针拿到的仍是健康检查 JSON) |
 | `GET /admin/egress` | 出口池 + 纯净度评分排序(代理 URL 的密码打码) |
-| `POST /admin/egress` | `{"action":"test"\|"pool"\|"force"\|"probe_image", ...}` |
+| `POST /admin/egress` | `{"action":"test"\|"pool"\|"force", ...}` |
 | `GET /admin/sessions` | 会话列表(`?limit=`) |
 | `POST /admin/sessions` | `{"sid":"..."}` 删一个,`{"all":true}` 清空 |
 | `POST /v1/debug/raw` | 回显上游原始响应;传 `{"inner":[...]}` 可原样下发给定 payload(逐槽位对比网页客户端行为) |
@@ -135,13 +110,10 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 `wrangler.toml` 里可选绑定:
 
 - `[[kv_namespaces]]` 绑定 `STATE`:热更新 cookie / bl / xsrf,无需重新部署
-- `[[d1_databases]]` 绑定 `DB`:会话表 `chat_sessions`、记忆表 `memories`、图片映射 `img_map`、R2 写入预算 `img_budget`,以及图片文件引用缓存表 `file_cache`(表会自动创建)
+- `[[d1_databases]]` 绑定 `DB`:会话表 `chat_sessions`、记忆表 `memories`、出口池与统计表 `egress_pool`/`egress_stats`,以及图片文件引用缓存表 `file_cache`(表会自动创建)
 - `[[durable_objects.bindings]]` 绑定 `EGRESS`(`EgressRelay`):区域出口池
-- `[[r2_buckets]]` 绑定 `FILECACHE`:生成图片的字节缓存(**图片中转需要**;未绑时保持上游直链)
-- `[vars]` `PUBLIC_ORIGIN`:对外真正可达的源(如 `https://api.example.org`)。**必须显式配置** —— 若入口是另一个中转 Worker,从 `request.url` 推导出来的是 `*.workers.dev`,客户端访问不到
-- `[triggers]` cron:定期抓 Gemini 首页刷新滚动 token(`__Secure-1PSIDTS` / `SNlM0e` / `bl`)
-
-> 建议给 R2 桶配一条生命周期规则(前缀 `img/`,7 天过期),存储自动回收,永远逼近不了免费额度。
+- `[[r2_buckets]]` 绑定 `FILECACHE`:多模态输入图片的文件引用缓存(未绑时退回 D1 `file_cache`)
+- `[triggers]` cron:定期抓 Gemini 首页刷新滚动 token(`__Secure-1PSIDTS` / `SNlM0e` / `bl`),并每 6h 跑一轮出口纯净度测试
 
 ## 配置项
 
@@ -168,18 +140,9 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 | `MEMORY_ENABLED` | 长期记忆开关(需要 D1) |
 | `MEMORY_AUTO_EXTRACT` | `true` = 每轮结束后额外调一次上游提炼事实(会让每轮多一次上游请求),默认关 |
 | `MEMORY_MAX_ITEMS` / `MEMORY_INJECT_MAX_BYTES` | 每个 scope 的记忆条数上限 / 注入 prompt 的字节上限 |
-| `IMAGE_PROXY` | `true`(默认)= 生成图经本域名中转;`false` = 透传上游直链 |
-| `PUBLIC_ORIGIN` | 对外可达的源(图片链接前缀)。不配则保持直链 |
-| `IMAGE_R2_STORE` / `IMAGE_R2_MONTHLY_MAX_BYTES` | 是否写 R2 / 月度写入上限(默认 4 GiB,留足 10 GB-月免费额度余量) |
-| `IMAGE_OBJECT_MAX_BYTES` | 单张超过此体积不落 R2(默认 12 MiB) |
-| `IMAGE_CACHE_TTL_SEC` / `IMAGE_PROXY_RATE_MAX` | 图片缓存时长(默认与 7 天生命周期对齐)/ `/img` 每 IP 每分钟限流 |
-| `GEMINI_API_KEY` | **官方 API key**(AI Studio)。配置后启用 `POST /v1/images/generations` **以及**聊天里的出图自动回退 |
-| `GEMINI_IMAGE_MODEL` | 官方出图模型,默认 `gemini-3.1-flash-image`(另有 `-3.1-flash-lite-image` / `-3-pro-image` / `2.5-flash-image`) |
-| `IMAGE_FALLBACK_API` | `true`(默认)= 网页端拒绝出图时自动改用官方 API 重试 |
 | `SSE_HEARTBEAT_MS` | 流式响应的心跳间隔(默认 5000)。生成期间定期发 `: ping` 注释行,防止客户端(Android OkHttp 默认读超时 10s)在静默期报 "unexpected end of stream";0 = 关闭 |
 | `EGRESS_POOL` | 出口池,逗号分隔:`colo:weur`、`proxy:socks5://user:pass@host:1080`、`relay:host:443`(盲转发中继)、`direct`。留空则沿用 `EGRESS_HINT*`。运行时可经 `/admin/egress` 热改(存 D1) |
 | `EGRESS_FORCE` | 强制走某个出口(id 或 target);空 = 按纯净度分数自动择优 |
-| `EGRESS_PROBE_IMAGE` | 纯净度探测是否顺带试一次图片生成(会真的调上游) |
 
 每个键都可以用同名 Worker 环境变量 / secret 覆盖。
 
@@ -209,12 +172,9 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 ## 已知限制
 
 - **上游风控**:Google 会按出口 IP 拒绝部分数据中心流量(`BardErrorInfo[1060]`)。在 Cloudflare 部署若遇此问题,把 `GEMINI_ORIGIN` 指向一个住宅/干净 IP 的反向代理,或依赖 `DO_EGRESS` 出口池换机房。
-- **图片生成受账号/出口限制**:上游可能直接回「Are you signed in? ... image creation isn't available in your location yet.」。这是 Gemini 侧对账号资格或出口 IP 的判断,与本仓库无关。已实测:七个 Cloudflare 机房**全部**被拒(见上一节),所以换机房没用 —— 需要接外部代理 IP,或用 `/admin/egress` 逐个试出一个能出图的出口。中转链路(`/img/<key>`)只负责转发与缓存,不解决这一点。
 - **会话绑在 Gemini 侧**:续聊依赖上游返回的 `cid`/`rid` 仍然有效;上游会话被清理或 cookie 换号后会退回新会话(不会报错)。
 - **隐式会话键可能撞车**:不给会话 id 时,键 = `API key + 首条用户消息`。若同时开着**两个第一句完全相同**的对话并交叉发消息,理论上会互相串上下文。用响应回传的 **cid 当会话 id** 可彻底避免;或显式带 `X-Session-Id`。单条消息的新请求永远不会误续,所以只影响「同开头 + 并发」这一种情况。
-- **`/img` 是公开端点**:靠不可猜的 key 当凭据(`<img>` 标签发不出 Authorization 头)。key 只由白名单内的 `googleusercontent.com` URL 生成,不构成任意 URL 代理;另有每 IP 限流。
-- **图片缓存 7 天后失效**:R2 生命周期到期删除后,若上游签名链也已过期,该图将无法再取回。
-- **图片需登录态**:未配置 `GEMINI_COOKIE` 时图片会被忽略并在 prompt 中提示。
+- **图片需登录态**:未配置 `GEMINI_COOKIE` 时图片输入会被忽略并在 prompt 中提示。
 - **限流为 isolate 级**:`RATE_LIMIT_*` 是每 isolate 内存计数,不是全局限流。
 
 ## 工作原理
@@ -230,7 +190,7 @@ npm run dev        # 本地 wrangler dev
 npm run deploy     # wrangler deploy
 ```
 
-`tests/worker.test.mjs`(多模态/MIME/SSRF/工具调用)、`tests/session.test.mjs`(会话续聊/记忆/图片中转)、`tests/egress.test.mjs`(出口解析/评分/SOCKS5 握手字节)、`tests/ui.test.mjs`(控制台页面完整性)都直接 import 纯函数,不联网、不需要 cookie;代理握手用假 socket 按字节校验。
+`tests/worker.test.mjs`(多模态/MIME/SSRF/工具调用)、`tests/session.test.mjs`(会话续聊/记忆)、`tests/egress.test.mjs`(出口解析/评分/SOCKS5 握手字节)、`tests/ui.test.mjs`(控制台页面完整性)都直接 import 纯函数,不联网、不需要 cookie;代理握手用假 socket 按字节校验。
 GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时跑 Node 20 与 22 的语法检查与单元测试。
 
 ## 致谢

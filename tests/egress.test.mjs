@@ -110,16 +110,18 @@ test("maskProxySpec hides the password", () => {
   assert.equal(maskProxySpec("socks5://1.2.3.4:1080"), "socks5://1.2.3.4:1080");
 });
 
-test("scoreEgress ranks image-capable exits above merely-working ones", () => {
-  const imageOk = scoreEgress({ text_status: "ok", image_status: "ok", latency_ms: 500 });
-  const textOnly = scoreEgress({ text_status: "ok", image_status: "blocked", latency_ms: 500 });
-  const rateLimited = scoreEgress({ text_status: "429", image_status: "blocked", latency_ms: 500 });
-  const broken = scoreEgress({ text_status: "1060", image_status: "error", latency_ms: 0 });
-  assert.ok(imageOk > textOnly, "image-capable must win");
-  assert.ok(textOnly > rateLimited);
+test("scoreEgress ranks a working exit above a rate-limited or broken one", () => {
+  const working = scoreEgress({ text_status: "ok", latency_ms: 500 });
+  const empty = scoreEgress({ text_status: "empty", latency_ms: 500 });
+  const rateLimited = scoreEgress({ text_status: "429", latency_ms: 500 });
+  const broken = scoreEgress({ text_status: "1060", latency_ms: 0 });
+  assert.ok(working > empty, "a real answer must beat an empty one");
+  assert.ok(empty > rateLimited);
   assert.ok(rateLimited > broken);
   assert.equal(scoreEgress(null), 0);
-  assert.ok(imageOk <= 100 && broken >= 0);
+  // 延迟也要参与打分:同样连通,快的应该排在前面
+  assert.ok(scoreEgress({ text_status: "ok", latency_ms: 300 }) > scoreEgress({ text_status: "ok", latency_ms: 9000 }));
+  assert.ok(working <= 100 && broken >= 0);
 });
 
 test("orderEgress sorts by score and honours an explicit force", () => {

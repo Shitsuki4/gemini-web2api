@@ -10,9 +10,6 @@ import {
   messageHash,
   renderSlice,
   renderMessageParts,
-  imageProxyUrl,
-  imgKeyOf,
-  handleImageProxy,
 } from "../worker.js";
 
 // 真实抓包(见 Codex/imgraw2.txt 的第 1 行):只有会话 id、没有内容体。
@@ -192,63 +189,3 @@ test("planTurn treats a declared delta request as the whole payload", () => {
   assert.equal(plan.reason, "delta-mode");
   assert.equal(plan.startIndex, 0);
 });
-
-test("imageProxyUrl rewrites only whitelisted upstream hosts", () => {
-  const cfg = { image_proxy: true, public_origin: "https://api.example.org", _env: { DB: {} } };
-  const good = "https://lh3.googleusercontent.com/gg/abc123";
-  assert.match(imageProxyUrl(cfg, good), /^https:\/\/api\.example\.org\/img\/[0-9a-f]{24}$/);
-  // 不能变成任意 URL 代理
-  assert.equal(imageProxyUrl(cfg, "https://evil.example.com/a.png"), "https://evil.example.com/a.png");
-  assert.equal(imageProxyUrl(cfg, "http://169.254.169.254/latest/meta-data/"), "http://169.254.169.254/latest/meta-data/");
-  // 没配对外域名就保持直链,免得给出一个打不开的地址
-  assert.equal(imageProxyUrl({ ...cfg, public_origin: "" }, good), good);
-  assert.equal(imageProxyUrl({ ...cfg, image_proxy: false }, good), good);
-});
-
-test("handleImageProxy rejects a malformed key and an unknown image", async () => {
-  const cfg = { image_cache_ttl_sec: 604800 };
-  const env = { DB: dbStub() };
-  const bad = await handleImageProxy("NOT-A-KEY", new Request("https://x/img/NOT-A-KEY"), cfg, env);
-  assert.equal(bad.status, 400);
-  const missing = await handleImageProxy("a".repeat(24), new Request("https://x/img/" + "a".repeat(24)), cfg, env);
-  assert.equal(missing.status, 404);
-});
-
-test("handleImageProxy fetches, serves and stores the image in R2", async () => {
-  const url = "https://lh3.googleusercontent.com/gg/generated-image";
-  const cfg = { image_proxy: true, public_origin: "https://api.example.org", image_cache_ttl_sec: 604800,
-                image_r2_store: true, image_r2_monthly_max_bytes: 4294967296, image_object_max_bytes: 12582912,
-                _env: {} };
-  const key = imgKeyOf(cfg, url);
-  const put = [];
-  const env = {
-    DB: dbStub(),
-    FILECACHE: {
-      get: async () => null,
-      put: async (k, bytes, opts) => { put.push({ k, size: bytes.byteLength, mime: opts.httpMetadata.contentType }); },
-    },
-  };
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { status: 200, headers: { "content-type": "image/png" } });
-  try {
-    const req = new Request(`https://x/img/${key}?s=${Buffer.from(url).toString("base64url")}`);
-    const res = await handleImageProxy(key, req, cfg, env);
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("Content-Type"), "image/png");
-    assert.equal((await res.arrayBuffer()).byteLength, 4);
-    assert.equal(put.length, 1, "image should be cached to R2");
-    assert.equal(put[0].k, "img/" + key);
-  } finally {
-    globalThis.fetch = realFetch;
-  }
-});
-
-function dbStub() {
-  const stmt = () => ({
-    bind: () => ({ first: async () => null, run: async () => ({ meta: { changes: 0 } }) }),
-    first: async () => null,
-    run: async () => ({ meta: { changes: 0 } }),
-  });
-  return { prepare: () => stmt() };
-}
