@@ -11,7 +11,9 @@
 - **Responses API**: `/v1/responses`(完整事件序列,兼容 Codex CLI 等严格客户端)
 - **Google 原生 API**: `/v1beta/models/{model}:generateContent` / `:streamGenerateContent`
 - **工具调用**: Function Calling(OpenAI 格式);大工具列表自动裁剪参数防静默截断
-- **图片生成**: 输出图片链接,同时以 `message.images[]` 返回;流式同样支持
+- **图片生成(两条通道)**:
+  - **网页端**:逆向 `StreamGenerate` 出图。**实测受「客户端 TLS/HTTP2 指纹」限制** —— 同一个 payload、同一个账号、同一个出口 IP,浏览器能出图、curl/Worker 不能(见下节)。所以这条通道在实践中出不了图。
+  - **官方 API 回退**(推荐):配置 `GEMINI_API_KEY` 后,① 开放 OpenAI 兼容的 `POST /v1/images/generations`;② 聊天里被「无法创建图片」拒绝时**自动改走官方 API 补一张**,现有客户端无需任何改动
 - **图片自建中转**: 生成图链接改写成 `<PUBLIC_ORIGIN>/img/<key>`,由本 worker 回源并按 key 缓存(Cloudflare 边缘缓存 + R2)。不再把 `googleusercontent.com` 直链交给客户端 —— 那个域名部分地区被墙,且 `gg-dl` 是带签名会过期的下载链
 - **服务端会话续聊(会话 = Gemini 会话 id)**: D1 `chat_sessions` 存着 Gemini 的会话标识(`cid`/`rid`/`rcid`),下一轮回填 `inner[2]`,**只把新增内容发上去**,历史留在 Gemini 侧
   - 响应会回传真实 cid:非流式看响应头 `X-Gemini-Cid`,流式看 SSE 注释 `: gemini-cid=c_…`(OpenAI 客户端会忽略 `:` 开头的行)。把这个 cid 当会话 id 传回来(`X-Session-Id: c_…` 或 body 的 `session_id`),**下一轮只发那一条新消息即可,无需携带历史** —— 这时一个会话就等价于 `gemini.google.com/app/<cid>`
@@ -62,16 +64,25 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 
 **代理隧道的实现**:`cloudflare:sockets` 的 `connect()` 建 TCP → HTTP 代理发 `CONNECT`(带 `Proxy-Authorization: Basic`)/ SOCKS5 做握手(支持用户名密码与域名 ATYP)→ `socket.startTls()` 到目标域名 → 复用同一套 HTTP/1.1 收发逻辑。隧道建成前不发送任何业务数据,所以 Gemini 的 cookie 不会明文暴露给代理。
 
-> **实测结论(2026-09-25,本部署)**:图片生成的开关是**出口 IP**,不是账号、不是 payload。
+> **实测结论(2026-09-26,决定性)**:图片生成的门槛是**客户端 TLS/HTTP2 指纹**,不是出口 IP、也不是 payload。
 >
-> 证据链(用 Roxy 浏览器的 CDP 抓的真实请求):
-> 1. 同一个浏览器、同一个账号,在 Gemini 网页上**能正常出图**(响应里拿到 `gg-dl` 图片链接);该请求经用户代理出口,位置显示为**台湾彰化**。
-> 2. 把这个浏览器请求的 payload **原样搬到本 Worker 重放**,照样被拒 —— 说明差异不在 payload。
-> 3. 逐项比对 cookie:`SID/HSID/SSID/APISID/SAPISID/__Secure-1PSID/__Secure-3PSID` **全部相同** —— 同一个账号、同一套登录态。
-> 4. 同一个请求经 Cloudflare 出口时,位置显示 **Netherlands**,被拒。
-> 5. 七个可用 Cloudflare 机房(`wnam/enam/sam/weur/eeur/apac/me`)逐个测:文本全正常,图片**全被拒**;`oc`/`afr` 直接 302。
+> 三行对照(同一账号、同一台湾住宅出口):
 >
-> 所以:**换 Cloudflare 机房解决不了图片生成**,要出图得接一个 IP 干净的**外部代理** —— 这正是出口池支持 `proxy:` 的原因。把可用的代理加进池里跑一次测试,`/admin/egress` 会直接告诉你哪个能出图。
+> | 组合 | 结果 |
+> |---|---|
+> | 我们的 payload + **curl** | ❌ 被拒 |
+> | 浏览器抓的真实 payload + **curl**(**1 秒内**重放) | ❌ 被拒 |
+> | **我们的 payload + 浏览器内部 fetch** | ✅ **出图** |
+>
+> 同一个 payload、同一个出口,只有客户端不同。⇒ Google 对图片生成这一敏感能力做了**客户端指纹校验**(防自动化),文本生成不校验(所以 Worker 一直能用)。
+>
+> **因为 Workers 的两条出网路径(`fetch()` 与 `connect()+startTls()`)都是 Cloudflare 自己的 TLS 栈、无法伪装 Chrome,所以 Worker 自身出不了图。**
+>
+> 已系统性排除的方向(别再重复):出口 IP / Cloudflare 机房 / payload 字段(`[1][2][3][4][6][17][30][41][49][68][71]` 全搬过来仍不出图) / 请求头(含能力标志 `16`) / `f.sid`/`SNlM0e` 陈旧 / 自造 cid / `inner[3]`·`inner[4]` 时效 token(**1 秒内**重放仍失败) / 账号资格(cookie 与浏览器**逐项相同**)。
+>
+> ⇒ 结论:**图片生成改走官方 API**(见上一节)。这是唯一不依赖浏览器指纹、且仍能在同一个 Worker 内完成的方案。
+
+> **出口池实测**:Cloudflare 只能把我们放在**美/欧/新西兰**(wnam=California、enam=US、sam=Illinois、me=Austria、weur=Netherlands、eeur=Warsaw、oc=Auckland),文本可用、图片全被拒;`apac`/`afr` 直接 302 到 `google.com/sorry`(异常流量验证码)。出口池骨架已就绪,**接一个可用代理即可**。
 >
 > 另外两个与机制相关的实测:`socket.startTls()` 必须以 `secureTransport: "starttls"` 建连(否则报 "must be set to 'starttls'");`https://` 代理不支持 —— Workers 的 socket 不能在已加密的连接上再 `startTls`,无法做双层 TLS。
 >
@@ -89,6 +100,7 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions(支持 `stream`) |
 | `POST /v1/responses` | OpenAI Responses API |
+| `POST /v1/images/generations` | OpenAI 兼容图片生成(需 `GEMINI_API_KEY`,走官方 API;未配置时返回 503 并说明原因) |
 | `GET /v1/models` | 模型列表 |
 | `POST /v1beta/models/{model}:generateContent` | Google 原生(非流式) |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Google 原生(流式,`?alt=sse`) |
@@ -161,6 +173,9 @@ relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYI
 | `IMAGE_R2_STORE` / `IMAGE_R2_MONTHLY_MAX_BYTES` | 是否写 R2 / 月度写入上限(默认 4 GiB,留足 10 GB-月免费额度余量) |
 | `IMAGE_OBJECT_MAX_BYTES` | 单张超过此体积不落 R2(默认 12 MiB) |
 | `IMAGE_CACHE_TTL_SEC` / `IMAGE_PROXY_RATE_MAX` | 图片缓存时长(默认与 7 天生命周期对齐)/ `/img` 每 IP 每分钟限流 |
+| `GEMINI_API_KEY` | **官方 API key**(AI Studio)。配置后启用 `POST /v1/images/generations` **以及**聊天里的出图自动回退 |
+| `GEMINI_IMAGE_MODEL` | 官方出图模型,默认 `gemini-3.1-flash-image`(另有 `-3.1-flash-lite-image` / `-3-pro-image` / `2.5-flash-image`) |
+| `IMAGE_FALLBACK_API` | `true`(默认)= 网页端拒绝出图时自动改用官方 API 重试 |
 | `SSE_HEARTBEAT_MS` | 流式响应的心跳间隔(默认 5000)。生成期间定期发 `: ping` 注释行,防止客户端(Android OkHttp 默认读超时 10s)在静默期报 "unexpected end of stream";0 = 关闭 |
 | `EGRESS_POOL` | 出口池,逗号分隔:`colo:weur`、`proxy:socks5://user:pass@host:1080`、`relay:host:443`(盲转发中继)、`direct`。留空则沿用 `EGRESS_HINT*`。运行时可经 `/admin/egress` 热改(存 D1) |
 | `EGRESS_FORCE` | 强制走某个出口(id 或 target);空 = 按纯净度分数自动择优 |

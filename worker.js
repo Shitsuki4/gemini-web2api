@@ -150,6 +150,15 @@ const CONFIG = {
   EGRESS_FORCE: "",
   // 纯净度探测是否顺带测「图片生成能不能出图」(图片才是真正卡人的指标,但会真的调一次生成)
   EGRESS_PROBE_IMAGE: true,
+  // ── 官方 Gemini API 出图(可选补充通道)─────────────────────────────────
+  // 网页端出图卡在「客户端 TLS/HTTP2 指纹」上(见 README),Worker 的 TLS 栈
+  // 伪装不了 Chrome,所以图片生成走官方 API 这条路。
+  // 配置 GEMINI_API_KEY 后:① 开放 /v1/images/generations;② 聊天里被
+  // 「无法创建图片」拒绝时自动改走官方 API 重试(客户端无需改动)。
+  GEMINI_API_KEY: "",
+  GEMINI_IMAGE_MODEL: "gemini-3.1-flash-image",
+  // 图片生成自动回退:网页端拒绝出图时,改用官方 API 重试
+  IMAGE_FALLBACK_API: true,
   // ── SSE 心跳 ────────────────────────────────────────────────────────────
   // 生成期间定期发 SSE 注释行,避免客户端(尤其 Android OkHttp,默认读超时 10s)
   // 在静默期判定连接已死、报 "unexpected end of stream"。0 = 关闭。
@@ -320,6 +329,9 @@ function getConfig(env) {
     egress_force: String(envOr(env, "EGRESS_FORCE", CONFIG.EGRESS_FORCE) || "").trim(),
     egress_probe_image: parseBool(envOr(env, "EGRESS_PROBE_IMAGE", CONFIG.EGRESS_PROBE_IMAGE), true),
     sse_heartbeat_ms: Math.max(0, parseIntDefault(envOr(env, "SSE_HEARTBEAT_MS", CONFIG.SSE_HEARTBEAT_MS), 5000)),
+    gemini_api_key: String(envOr(env, "GEMINI_API_KEY", CONFIG.GEMINI_API_KEY) || "").trim(),
+    gemini_image_model: String(envOr(env, "GEMINI_IMAGE_MODEL", CONFIG.GEMINI_IMAGE_MODEL) || "gemini-3.1-flash-image"),
+    image_fallback_api: parseBool(envOr(env, "IMAGE_FALLBACK_API", CONFIG.IMAGE_FALLBACK_API), true),
     _env: env,
     _ctx: null,
     _cookieSource: cookieEntries.length > 1 ? "env-pool" : (env.GEMINI_COOKIE || env.GEMINI_COOKIES || env.COOKIE_STRING ? "env" : (CONFIG.GEMINI_COOKIE ? "builtin" : "none")),
@@ -2369,6 +2381,11 @@ async function handleChat(req, cfg, request) {
           log(cfg, `chat stream produced no content -> ${note}`);
           chunk({ content: note }, null); // 让客户端看到原因,而非空白
         }
+        // 网页端拒绝出图时,用官方 API 补一张
+        if (acc) {
+          const imgUrl = await imageFallbackViaApi(cfg, cfg._env, promptBody || prompt, acc);
+          if (imgUrl) chunk({ content: `\n\n![generated image](${imgUrl})` }, null);
+        }
         await finishTurn(got, acc);
         chunk({}, "stop");
         // 流式响应头在开始时就固定了,新会话那时还没有 cid —— 用 SSE 注释回传。
@@ -2395,6 +2412,11 @@ async function handleChat(req, cfg, request) {
   if (!text && !toolCalls) {
     log(cfg, "chat non-stream produced no content (empty upstream)");
     text = EMPTY_UPSTREAM_MSG; // 可见提示,避免客户端“无返回”
+  }
+  // 网页端拒绝出图时,用官方 API 补一张(客户端无需改动)
+  if (text && !toolCalls) {
+    const imgUrl = await imageFallbackViaApi(cfg, cfg._env, promptBody || prompt, text);
+    if (imgUrl) text = `${text}\n\n![generated image](${imgUrl})`;
   }
   await finishTurn(true, text);
   const msg = { role: "assistant", content: text || null };
@@ -3358,6 +3380,98 @@ async function handleImageProxy(key, request, cfg, env) {
   return res;
 }
 
+// ── 官方 Gemini API 出图 ───────────────────────────────────────────────────
+const OFFICIAL_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+/**
+ * 用官方 Gemini API 生成图片。返回 { bytes, mime }。
+ * 这是「网页端出图被指纹卡住」的补充通道:走正规 API,没有客户端指纹校验。
+ */
+async function officialImageGenerate(cfg, prompt, opts) {
+  const key = cfg && cfg.gemini_api_key;
+  if (!key) throw new Error("GEMINI_API_KEY 未配置,无法使用官方出图通道");
+  const model = (opts && opts.model) || cfg.gemini_image_model || "gemini-3.1-flash-image";
+  const url = `${OFFICIAL_API_BASE}/models/${encodeURIComponent(model)}:generateContent`;
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: String(prompt || "").slice(0, 4000) }] }],
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: timeoutSignal(120000),
+  });
+  const text = await r.text();
+  if (!r.ok) {
+    throw new Error(`官方 API ${r.status}: ${text.slice(0, 300)}`);
+  }
+  let j;
+  try { j = JSON.parse(text); } catch (_) { throw new Error("官方 API 返回非 JSON: " + text.slice(0, 200)); }
+  const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+  for (const p of parts) {
+    const inline = p.inlineData || p.inline_data;
+    if (inline && inline.data) {
+      const mime = inline.mimeType || inline.mime_type || "image/png";
+      return { bytes: base64ToBytes(inline.data), mime };
+    }
+  }
+  const reason = (j.candidates && j.candidates[0] && j.candidates[0].finishReason) || "";
+  const said = parts.map((p) => p.text || "").join(" ").trim();
+  throw new Error("官方 API 未返回图片" + (reason ? ` (finishReason=${reason})` : "") + (said ? ": " + said.slice(0, 200) : ""));
+}
+/** 把生成的图片字节存进 R2(键沿用 img/<key>),返回可对外访问的 URL。 */
+async function publishImageBytes(cfg, env, bytes, mime, seed) {
+  const key = syncHash(String(seed || "") + "|" + bytes.byteLength + "|" + Date.now()).slice(0, 24);
+  if (env && env.FILECACHE) {
+    try {
+      await env.FILECACHE.put("img/" + key, bytes, {
+        httpMetadata: { contentType: mime || "image/png", cacheControl: `public, max-age=${cfg.image_cache_ttl_sec || 604800}` },
+      });
+    } catch (e) { log(cfg, `官方出图写 R2 失败: ${e}`); }
+  }
+  const origin = cfg.public_origin || "";
+  return origin ? `${origin}/img/${key}` : "";
+}
+/** POST /v1/images/generations —— OpenAI 兼容的图片生成端点。 */
+async function handleImagesGenerations(req, cfg, env) {
+  if (!cfg.gemini_api_key) {
+    return jsonResponse({
+      error: { message: "图片生成需要配置 GEMINI_API_KEY(网页端出图受客户端指纹限制,见 README)", type: "image_backend_unavailable" },
+    }, 503);
+  }
+  const prompt = String(req.prompt || "").trim();
+  if (!prompt) return jsonResponse({ error: { message: "prompt is required" } }, 400);
+  const n = Math.min(Math.max(Number(req.n) || 1, 1), 4);
+  const out = [];
+  try {
+    for (let i = 0; i < n; i++) {
+      const { bytes, mime } = await officialImageGenerate(cfg, prompt, { model: req.model && !/^gemini-3\.(7|6|5|8)-flash/.test(req.model) ? req.model : null });
+      const url = await publishImageBytes(cfg, env, bytes, mime, prompt + "#" + i);
+      out.push(url ? { url } : { b64_json: bytesToBase64(bytes), revised_prompt: prompt });
+    }
+  } catch (e) {
+    return jsonResponse({ error: { message: String((e && e.message) || e) } }, 502);
+  }
+  return jsonResponse({ created: nowSec(), data: out });
+}
+/**
+ * 聊天里被网页端拒绝出图时的回退:改用官方 API 生成,把图片接到回复里。
+ * 找不到图片意图就原样返回,不改变行为。
+ */
+async function imageFallbackViaApi(cfg, env, prompt, text) {
+  if (!cfg.gemini_api_key || cfg.image_fallback_api === false) return null;
+  if (!IMAGE_REGION_RE.test(String(text || ""))) return null;
+  try {
+    const { bytes, mime } = await officialImageGenerate(cfg, prompt);
+    const url = await publishImageBytes(cfg, env, bytes, mime, prompt);
+    if (!url) return null;
+    log(cfg, "网页端拒绝出图,已用官方 API 回退成功");
+    return url;
+  } catch (e) {
+    log(cfg, `官方 API 出图回退失败: ${(e && e.message) || e}`);
+    return null;
+  }
+}
+
 // ── 记忆 HTTP 接口 ─────────────────────────────────────────────────────────
 async function handleMemories(request, cfg, env, url, method, req) {
   const scope = memoryScope(request, req);
@@ -3592,6 +3706,8 @@ export default {
             image_proxy: !!cfg.image_proxy,
             public_origin: cfg.public_origin || "",
             r2_bound: !!env.FILECACHE,
+            image_api_fallback: !!cfg.gemini_api_key && cfg.image_fallback_api !== false,
+            image_api_model: cfg.gemini_api_key ? cfg.gemini_image_model : "",
             egress_pool: (cfg._egressOrder || []).map((e) => e.id),
             egress_force: cfg.egress_force || "",
             ts: Date.now(),
@@ -3649,6 +3765,10 @@ export default {
         if (path === "/v1/chat/completions") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await berrRetry(() => handleChat(req, cfg, request));
+        }
+        if (path === "/v1/images/generations") {
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleImagesGenerations(req, cfg, env);
         }
         if (path === "/v1/responses") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
@@ -4129,6 +4249,7 @@ export {
   syncHash, extractSessionMeta, sessionKey, planTurn, messageHash, renderSlice, renderMessageParts,
   memoryBlock, memoryList, memoryAdd, memoryScope, imageProxyUrl, imgKeyOf, handleImageProxy,
   sseResponse, extractEgressLocation,
+  officialImageGenerate, publishImageBytes, imageFallbackViaApi, handleImagesGenerations,
   parseEgressSpec, entryToSpec, defaultEgressPool, scoreEgress, orderEgress, maskProxySpec, socks5Connect, streamSource,
   httpOverSocket, proxyHttpFetch, applyEgressAttempt,
 };
