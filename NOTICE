@@ -1,0 +1,18 @@
+gemini-web2api — Cloudflare-native rewrite
+
+Protocol research and implementation reference:
+  zexadev/gemini-web2api-go
+  https://github.com/zexadev/gemini-web2api-go
+  Reference commit: 2158ea0bce6f5ae9cd7e8e9c04d4fd58b7986195
+  Copyright (c) 2026 gemini-web2api-go contributors
+  MIT License — full notice is included in LICENSE.
+
+The TypeScript request header/payload layout, cookie rotation, upload,
+conversation and media protocol adapters are derived from that project's
+protocol implementation. This rewrite does not distribute its Go binaries,
+Chrome TLS fingerprinting stack, or an external proxy implementation.
+
+Repository history before this rewrite is retained on the original main
+branch and in git history. Historical upstream attribution remains there.
+Cloudflare and Google/Gemini are trademarks of their respective owners.
+This project is unofficial and is not endorsed by either company.

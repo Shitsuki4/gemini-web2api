@@ -1,202 +1,120 @@
-# gemini-web2api (Cloudflare Worker)
+# gemini-web2api · Cloudflare 原生重构
 
-> **独立项目**:本仓库不是 GitHub fork,而是一个独立维护的仓库(历史来自早期 fork,现已脱离 fork 关系)。参考上游 Python 版 [Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api/) 的能力,已在 Cloudflare Workers 上对齐到 **2026-09-25(`codex/openai-multimodal-support`, `4c934286`)** 并做了 Workers 侧增强(区域出口池、KV/D1 状态、SSRF 防护等)。
+使用 **Workers + SQLite Durable Objects + D1 + 静态资源**，将 Gemini 网页协议适配为 HTTP API。参考 [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)，不是把 Go 服务器搬进容器，也不依赖外部代理、VPS、R2 或常驻本地浏览器。
 
-把 Google Gemini 网页端转换为 OpenAI / Google 原生兼容 API 的单文件 Cloudflare Worker(`worker.js`)。
+> **当前状态：实验性，尚未通过真实生成验收。** 2026-10-05 的独立 Cloudflare 测试部署可以鉴权、导入 Roxy 登录态、管理账号和列出模型；真实文本请求被 Google 重定向至 `/sorry`，返回 `502 / egress_blocked`。没有真实文本、图片、音乐或视频成功证据。单元测试和模拟上游集成测试不能证明 Google 接受 Cloudflare 出口。不要据此替换正在使用的服务。详见[验收报告](docs/verification.md)。
 
-## 特性
+## 能做什么
 
-- **可选密钥**: `API_KEYS` 为空时免密,填入密钥后按 OpenAI Bearer Key 校验
-- **OpenAI 兼容**: `/v1/chat/completions`、`/v1/models`
-- **Responses API**: `/v1/responses`(完整事件序列,兼容 Codex CLI 等严格客户端)
-- **Google 原生 API**: `/v1beta/models/{model}:generateContent` / `:streamGenerateContent`
-- **工具调用**: Function Calling(OpenAI 格式);大工具列表自动裁剪参数防静默截断
-- **服务端会话续聊(会话 = Gemini 会话 id)**: D1 `chat_sessions` 存着 Gemini 的会话标识(`cid`/`rid`/`rcid`),下一轮回填 `inner[2]`,**只把新增内容发上去**,历史留在 Gemini 侧
-  - 响应会回传真实 cid:非流式看响应头 `X-Gemini-Cid`,流式看 SSE 注释 `: gemini-cid=c_…`(OpenAI 客户端会忽略 `:` 开头的行)。把这个 cid 当会话 id 传回来(`X-Session-Id: c_…` 或 body 的 `session_id`),**下一轮只发那一条新消息即可,无需携带历史** —— 这时一个会话就等价于 `gemini.google.com/app/<cid>`
-  - **点名 cid 时以上游会话为准**:即使本地历史对不上(客户端截断了旧消息、每轮都换 system prompt 之类)也照样续,只发最后一条用户消息 —— 不会退回「重发全量」,长对话因此不会发几轮就爆
-  - 不给会话 id 时,按「API Key + 首条用户消息」隐式归组,并用「条数 + 渲染指纹」校验前缀;对不上就当新会话(保守,不串话)。`X-Session-Mode: delta` 可显式声明「我只发增量」
-- **跨会话长期记忆**: 事实存 D1,开新会话时注入 prompt;`/v1/memories` 增删查,`X-Memory-Scope` 做分组隔离,可选每轮自动提炼
-- **可切换出口池 + 纯净度排序**: 出口支持四种写法(`direct` / `colo:weur` Cloudflare 机房 / `socks5://`·`http://` 外部代理 / `relay:host:port` 盲转发中继),每个出口实测打分后按分数择优使用,失败自动轮换。代理隧道建好后一律 `startTls` 到目标域名,不把 cookie 明文交给代理
-- **网页控制台**: `/ui`(根路径对浏览器自动返回它),含对话、会话管理、长期记忆、出口池测试与状态面板
-- **多模型**: `gemini-3.8-flash`(默认)、`gemini-3.8-flash-thinking`(扩展思考)、`gemini-3.1-pro`、`gemini-auto`、`gemini-flash-lite` 等;旧版本名(3.7/3.6/3.5)保留为指向 3.8 的别名
-- **思考深度**: 模型名加 `@think=N` 后缀调节
-- **多模态输入**: 支持 OpenAI `image_url` / `input_image` / Anthropic `image` 风格(base64 data: URL、URL-encoded data: URL、http(s) 链接);需配置 `GEMINI_COOKIE`,经 Scotty 续传上传到 Gemini
-- **图片 MIME 嗅探**: 按 magic bytes 修正 PNG/JPEG/GIF/WebP/BMP/TIFF/AVIF/HEIC,不信任声明的 content-type
-- **SSRF 防护**: http(s) 白名单 + 内网/元数据地址拦截 + Cloudflare DoH(回退 Google DoH)解析校验 + 每跳重定向复检 + 20MB 体积上限(见下)
-- **图片引用缓存**: 同一张图按内容 SHA-256 缓存 Gemini 文件引用,命中则跳过重复上传(R2 优先,未绑 R2 时退 D1 `file_cache`)
-- **多 Google 账号**: `AUTH_USER` 指定非默认账号(`/u/{n}` 前缀 + `X-Goog-AuthUser` 头)
-- **XSRF token**: 可选 `XSRF_TOKEN`(SNlM0e),payload 自动带 `at=` 参数
-- **临时会话**: `TEMPORARY_CHATS=true` 时按 Gemini Web 临时会话发送(不落历史)
-- **BL 自动更新**: 上游 405(BL 过期)时自动抓取最新构建号并重试一次
-- **错误透传**: `BardErrorInfo[code]` 拒绝时返回明确错误,不再静默空白
-- **流式可靠性**: 重试时校验已输出前缀一致,防止内容错乱
-- **出口 IP 规避**: 上游请求优先走 `cloudflare:sockets` 裸 TCP,绕开 fetch 的 429 限流
-- **区域出口池**: `DO_EGRESS` + `EgressRelay` Durable Object 按 `weur/eeur/wnam` 等 locationHint 轮换出口机房
-- **1060/429 自动换出口重试**: `BardErrorInfo[1060]` 与 429 都会触发换出口重试;被上游拒的出口冷却 90s 并跳过,不会把重试预算耗在同一个坏出口上
-- **客户端 IP 日志**: 访问日志携带 `cf-connecting-ip`
+| 功能             | 本实现                                                       | 验证边界                                                                  |
+| ---------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| OpenAI Chat、SSE | `/v1/chat/completions`，累计文本转增量、背压、心跳、取消     | 模拟上游通过，真实上游阻断                                                |
+| Responses        | `/v1/responses`，基本文本/函数调用事件，失败生命周期         | 非完整 OpenAI 替代；不支持 `previous_response_id`                         |
+| 会话续接         | API Key 隔离、账号固定、加密元数据、默认 7 天 TTL            | 必须传 `session_id`，每轮仅新增一条 user/tool 消息                        |
+| 账号池           | 每账号一个 DO，串行生成、6 次尝试/分钟、冷却、最久未使用优先 | 不提供 IP 池或地区解锁保证                                                |
+| 文件输入         | base64 data URL，最多 4 个附件                               | 单文件 768 KiB，整个请求 1 MiB；拒绝远程文件 URL                          |
+| 图片/音乐/Canvas | 网页工具开关和鉴权下载代理                                   | 实验性，受 Google 账号权益影响，未实测成功                                |
+| 视频             | 提交作业、DO Alarm 轮询、状态/鉴权下载                       | 实验性，10 分钟超时，不自动重放不确定的提交                               |
+| 函数工具 / JSON  | 提示词模拟工具调用；JSON object 输出解析检查                 | 非原生函数协议，不执行工具，不保证遵守提示词，拒绝 strict schema          |
+| Google API       | 基础非流式 `generateContent`                                 | 只做文本/inlineData 适配，不支持完整 generationConfig、安全设置或原生流式 |
+| 中文管理台       | 账号、密钥、请求统计、流式调试、配置                         | ADMIN_KEY 只保存在页面内存                                                |
 
-## 出口池与纯净度排序
+不会伪造 token 用量，不导出私有推理过程，不把错误包装成成功。`/healthz` 仅表示网关存活，不表示 Gemini 可用。
 
-Google 会按**出口 IP** 区别对待请求:有的直接 `BardErrorInfo[1060]`,有的 429/reCAPTCHA。出口池把「出口」抽象成可切换、可打分、可排序的一等公民。
+## 部署到自己的 Cloudflare 账号
 
-四种出口:
+需要 Node.js 22+、Cloudflare Workers Free 账号，以及自己有权使用的 Gemini 登录态。下列步骤适用于**新建独立实例**；旧版本升级先读[迁移与回滚](docs/operations.md)。
 
-```ini
-direct                                   # 直接用 Worker 自带出口
-colo:weur                                # 经 EgressRelay Durable Object,落在该 Cloudflare 机房
-proxy:socks5://user:pass@1.2.3.4:1080    # 外部代理(也支持 http:// 与 https://)
-relay:1.2.3.4:443                        # 盲转发中继(edgetunnel 的 PROXYIP 就是这种)
+```powershell
+npm ci
+npx wrangler login
+npx wrangler d1 create gemini-web2api-v3
 ```
 
-`relay:` 假设中继按 **SNI** 决定往哪转,所以不需要 CONNECT/SOCKS 握手:连上中继后直接
-`startTls({ expectedServerHostname: 目标域名 })` 再讲 HTTPS。这正是不少「反代/中转 IP」
-类服务的工作方式。
+将命令返回的数据库 ID 写入 `wrangler.toml` 的 `database_id`。保留独立 Worker 名称 `gemini-web2api-native`，不要直接覆盖旧服务名称。
 
-- 配置走 `EGRESS_POOL`,运行时可经 `/admin/egress` 热改(存 D1,强一致)。
-- **打分**:文本通 40 / 通但空 10 / 429(能连上、只是被限流)4 / 5xx 2 / 1060 或超时 0;再按延迟加 0~10 分。
-- 请求时按分数从高到低轮换,失败自动换下一个;`EGRESS_FORCE` 或前端「强制」可钉死某个出口。
-- cron 每 6h 自动跑一轮测试,前端也能手动触发。
-
-**代理隧道的实现**:`cloudflare:sockets` 的 `connect()` 建 TCP → HTTP 代理发 `CONNECT`(带 `Proxy-Authorization: Basic`)/ SOCKS5 做握手(支持用户名密码与域名 ATYP)→ `socket.startTls()` 到目标域名 → 复用同一套 HTTP/1.1 收发逻辑。隧道建成前不发送任何业务数据,所以 Gemini 的 cookie 不会明文暴露给代理。
-
-> **出口池实测**:Cloudflare 只能把我们放在**美/欧/新西兰**(wnam=California、enam=US、sam=Illinois、me=Austria、weur=Netherlands、eeur=Warsaw、oc=Auckland);`apac`/`afr` 直接 302 到 `google.com/sorry`(异常流量验证码)。出口池骨架已就绪,接一个可用代理即可。
->
-> 另外两个与机制相关的实测:`socket.startTls()` 必须以 `secureTransport: "starttls"` 建连(否则报 "must be set to 'starttls'");`https://` 代理不支持 —— Workers 的 socket 不能在已加密的连接上再 `startTls`,无法做双层 TLS。
->
-> 代理隧道这一路已逐层验证过,结论是「缺一个能用的代理」,不是代码问题:
-> - `POST /v1/debug/egress` 传 `{"egress":"proxy:…","url":"http://api.ipify.org/"}`:纯 HTTP 穿过隧道**成功**,并且返回的正是代理自己的 IP → 隧道转发正常、出口确实换掉了。
-> - 同一隧道走 `https://` → `TLS Handshake Failed`。
-> - `{"egress":"raw-starttls"}`(不经代理、直接 starttls 连 443)→ **成功**。
-> - `{"egress":"smtp-starttls"}`(SMTP 的 STARTTLS 流程,天生是「先明文收发、再升级」)→ **成功升级**,证明运行时支持在明文 I/O 之后 `startTls`。
->
-> 即:代码路径没问题,是**那两个代理在 CONNECT 隧道里不承载 TLS**(典型是做了 TLS 拦截)。换一个不做 MITM 的 SOCKS5/HTTP 代理即可,加进池里跑一次测试直接看结果。
-
-## HTTP 端点
-
-| 端点 | 说明 |
-|---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions(支持 `stream`) |
-| `POST /v1/responses` | OpenAI Responses API |
-| `GET /v1/models` | 模型列表 |
-| `POST /v1beta/models/{model}:generateContent` | Google 原生(非流式) |
-| `POST /v1beta/models/{model}:streamGenerateContent` | Google 原生(流式,`?alt=sse`) |
-| `GET /health` · `GET /healthz` | 健康检查(版本、模型数、cookie 状态、出口提示、限流参数) |
-| `GET /v1/memories` | 列出长期记忆(`X-Memory-Scope` 指定分组) |
-| `POST /v1/memories` | 新增记忆:`{"memories":["..."]}` 或 `{"content":"..."}` |
-| `DELETE /v1/memories` | 删除:`{"id":"..."}` 删一条,空 body 清空该 scope |
-| `GET /admin/state` | 运行状态(加 `?live=1` 实地探测上游) |
-| `POST /admin/cookie` | 热更新 cookie/state(写入 KV) |
-| `GET /ui` | 网页控制台(根路径 `GET /` 在 `Accept: text/html` 时也返回它;探针拿到的仍是健康检查 JSON) |
-| `GET /admin/egress` | 出口池 + 纯净度评分排序(代理 URL 的密码打码) |
-| `POST /admin/egress` | `{"action":"test"\|"pool"\|"force", ...}` |
-| `GET /admin/sessions` | 会话列表(`?limit=`) |
-| `POST /admin/sessions` | `{"sid":"..."}` 删一个,`{"all":true}` 清空 |
-| `POST /v1/debug/raw` | 回显上游原始响应;传 `{"inner":[...]}` 可原样下发给定 payload(逐槽位对比网页客户端行为) |
-| `POST /v1/debug/egress` | 出口连通性诊断:`{"egress":"proxy:...","url":"https://..."}`(目标域名白名单限制,避免变成任意 URL 抓取);`egress` 传 `"raw-starttls"` 或 `"smtp-starttls"` 可验证运行时本身能否做 TLS 升级 |
-| `GET /debug` | 从部署环境实地探测上游(状态/片段/BL) |
-
-## 快速开始
-
-1. 复制 `worker.js` 全部内容
-2. Cloudflare 后台 → Workers & Pages → Create → 粘贴 → Deploy
-3. (推荐)在 Worker Settings → Variables and Secrets 里配置:
-   - `GEMINI_COOKIE`(secret):Gemini 登录 cookie,解锁 Pro 路由和图片输入
-   - `API_KEYS`(secret):调用方密钥,留空则任何人可调用
-
-也可以直接编辑 `worker.js` 顶部的 `CONFIG` 对象,无需任何环境变量。
-
-## 部署配置(wrangler)
-
-`wrangler.toml` 里可选绑定:
-
-- `[[kv_namespaces]]` 绑定 `STATE`:热更新 cookie / bl / xsrf,无需重新部署
-- `[[d1_databases]]` 绑定 `DB`:会话表 `chat_sessions`、记忆表 `memories`、出口池与统计表 `egress_pool`/`egress_stats`,以及图片文件引用缓存表 `file_cache`(表会自动创建)
-- `[[durable_objects.bindings]]` 绑定 `EGRESS`(`EgressRelay`):区域出口池
-- `[[r2_buckets]]` 绑定 `FILECACHE`:多模态输入图片的文件引用缓存(未绑时退回 D1 `file_cache`)
-- `[triggers]` cron:定期抓 Gemini 首页刷新滚动 token(`__Secure-1PSIDTS` / `SNlM0e` / `bl`),并每 6h 跑一轮出口纯净度测试
-
-## 配置项
-
-| 键 | 说明 |
-|---|---|
-| `API_KEYS` | 逗号分隔或 JSON 数组;空 = 不鉴权 |
-| `GEMINI_COOKIE` / `GEMINI_COOKIES` / `COOKIE_STRING` | 完整 cookie 字符串(或 JSON `{"cookie","sapisid"}`);`GEMINI_COOKIES` 用 `\|` 分隔多个账号组成 cookie 池 |
-| `GEMINI_BL` | Gemini 网页构建号(过期后请求会被 405 拒绝;`AUTO_UPDATE_BL=true` 时自动更新) |
-| `GEMINI_ORIGIN` | 上游源站;部署 IP 被 Google 429 时指向干净 IP 的反向代理 |
-| `UPSTREAM_SOCKET` | `true`=上游优先裸 socket(绕 fetch 429) |
-| `AUTH_USER` | Google 多账号序号,留空 = 默认账号 |
-| `XSRF_TOKEN` | 可选 SNlM0e at-token,风控严格环境需要 |
-| `TEMPORARY_CHATS` | `true` = 临时会话,不保存历史 |
-| `AUTO_UPDATE_BL` | `true` = 405 时自动抓最新 BL 重试 |
-| `DEFAULT_MODEL` | 默认模型(默认 `gemini-3.6-flash`) |
-| `RETRY_ATTEMPTS` / `RETRY_DELAY_SEC` / `REQUEST_TIMEOUT_SEC` | 重试与超时 |
-| `DO_EGRESS` / `EGRESS_HINT` / `EGRESS_FALLBACK_HINTS` | 区域出口池开关与机房顺序(默认 `weur,eeur,wnam`) |
-| `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_SEC` | 每 isolate 滑动窗口限流(默认 3000 / 60s,超出返回 429) |
-| `FINGERPRINT_JITTER_MS` | 请求前随机抖动(默认 1500ms),降低风控特征 |
-| `LOG_REQUESTS` | 访问日志开关 |
-| `SESSION_MEMORY` | `true`(默认)= 服务端会话续聊;`false` = 退回「每轮重发整段历史」的旧行为 |
-| `SESSION_TTL_SEC` | 会话映射保留时长(默认 604800 = 7 天),超时按新会话处理 |
-| `SESSION_DELTA_DEFAULT` | `true` = 默认认为客户端只发增量(需显式给会话 id) |
-| `MEMORY_ENABLED` | 长期记忆开关(需要 D1) |
-| `MEMORY_AUTO_EXTRACT` | `true` = 每轮结束后额外调一次上游提炼事实(会让每轮多一次上游请求),默认关 |
-| `MEMORY_MAX_ITEMS` / `MEMORY_INJECT_MAX_BYTES` | 每个 scope 的记忆条数上限 / 注入 prompt 的字节上限 |
-| `SSE_HEARTBEAT_MS` | 流式响应的心跳间隔(默认 5000)。生成期间定期发 `: ping` 注释行,防止客户端(Android OkHttp 默认读超时 10s)在静默期报 "unexpected end of stream";0 = 关闭 |
-| `EGRESS_POOL` | 出口池,逗号分隔:`colo:weur`、`proxy:socks5://user:pass@host:1080`、`relay:host:443`(盲转发中继)、`direct`。留空则沿用 `EGRESS_HINT*`。运行时可经 `/admin/egress` 热改(存 D1) |
-| `EGRESS_FORCE` | 强制走某个出口(id 或 target);空 = 按纯净度分数自动择优 |
-
-每个键都可以用同名 Worker 环境变量 / secret 覆盖。
-
-## 图片输入与 SSRF 防护
-
-图片输入支持三种形态,统一走 `imageFromPart()` 归一化:
-
-```jsonc
-// OpenAI Chat Completions
-{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}   // 或 https:// 链接
-// OpenAI Responses
-{"type":"input_image","image_url":"https://example.com/a.png"}
-// Anthropic
-{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"..."}}
+```powershell
+npm run setup:secrets
+npm run db:remote
+npx wrangler secret bulk .local/secrets.json
+npm run deploy
 ```
 
-远程 URL 的防护(`fetchRemoteImage`):
+`setup:secrets` 生成独立的管理员密钥、API 密钥和 AES-GCM 密钥，**不会覆盖已有文件**。如果提示文件已存在，应复用/备份原密钥而不是删除重建。`.local/` 已忽略，切勿上传或分享。使用 API Token 时只授权目标账号必要的 Workers、D1 权限，不要把 Global API Key 写入项目。
 
-- 仅允许 `http:` / `https:`,拒绝带用户名/密码的 URL
-- 拒绝 `localhost` / `*.local` / `*.internal` / `*.home.arpa` / `metadata.google.internal`
-- 拒绝回环、私有、链路本地、CGNAT、组播段(`127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`::1`、`fc00::/7`、`fe80::/10`、v4-mapped 等)
-- 域名先经 DoH(Cloudflare,失败回退 Google)解析,命中内网 IP 即拦截;DoH 全部失败时**失败关闭**
-- 手动跟跳重定向,每一跳都重新做上述校验,最多 5 跳
-- 单图 20MB 上限;按 magic bytes 嗅探真实类型
-- 全部图片上传失败时返回 `502 all image uploads failed: ...`;部分失败会记录日志并继续
+## 从 Roxy 导入登录态
 
-## 已知限制
+在 Roxy 中打开已登录的 `https://gemini.google.com/app`，取得该浏览器的 CDP 地址。仅需导入时连接本地浏览器；没有驻留脚本。登录过期或设备绑定导致续期失败时，需要再次人工登录/导入。
 
-- **上游风控**:Google 会按出口 IP 拒绝部分数据中心流量(`BardErrorInfo[1060]`)。在 Cloudflare 部署若遇此问题,把 `GEMINI_ORIGIN` 指向一个住宅/干净 IP 的反向代理,或依赖 `DO_EGRESS` 出口池换机房。
-- **会话绑在 Gemini 侧**:续聊依赖上游返回的 `cid`/`rid` 仍然有效;上游会话被清理或 cookie 换号后会退回新会话(不会报错)。
-- **隐式会话键可能撞车**:不给会话 id 时,键 = `API key + 首条用户消息`。若同时开着**两个第一句完全相同**的对话并交叉发消息,理论上会互相串上下文。用响应回传的 **cid 当会话 id** 可彻底避免;或显式带 `X-Session-Id`。单条消息的新请求永远不会误续,所以只影响「同开头 + 并发」这一种情况。
-- **图片需登录态**:未配置 `GEMINI_COOKIE` 时图片输入会被忽略并在 prompt 中提示。
-- **限流为 isolate 级**:`RATE_LIMIT_*` 是每 isolate 内存计数,不是全局限流。
+下面按提示填写自己的部署地址及 CDP 地址，密钥从本地文件读入内存，不打印：
 
-## 工作原理
-
-逆向 Google Gemini 网页端的 StreamGenerate 协议,将 OpenAI API 格式与 Gemini 内部 protobuf-like 格式互转。模型选择通过请求 payload 的 `[79]` 字段控制,映射自 Gemini 前端 JS 的 `MODE_CATEGORY` 枚举。图片经 Scotty 续传接口上传换取文件引用,再随 payload 一起发送。
-
-## 开发与测试
-
-```bash
-npm test           # 单元测试(multimodal 解析 / MIME 嗅探 / SSRF 校验 / 工具调用解析)
-npm run check      # 语法检查 worker.js 与 proxy/worker.js
-npm run dev        # 本地 wrangler dev
-npm run deploy     # wrangler deploy
+```powershell
+$secrets = Get-Content .local/secrets.json -Raw | ConvertFrom-Json
+$env:ADMIN_KEY = $secrets.ADMIN_KEY
+$env:API_KEY = $secrets.API_KEY
+$env:GATEWAY_URL = Read-Host 'Worker HTTPS 地址'
+$cdp = Read-Host 'Roxy CDP 地址，例如 http://127.0.0.1:15639'
+node scripts/sync-roxy.mjs --origin $env:GATEWAY_URL --cdp $cdp
+npm run smoke
 ```
 
-`tests/worker.test.mjs`(多模态/MIME/SSRF/工具调用)、`tests/session.test.mjs`(会话续聊/记忆)、`tests/egress.test.mjs`(出口解析/评分/SOCKS5 握手字节)、`tests/ui.test.mjs`(控制台页面完整性)都直接 import 纯函数,不联网、不需要 cookie;代理握手用假 socket 按字节校验。
-GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时跑 Node 20 与 22 的语法检查与单元测试。
+脚本只输出账号 ID、Cookie 数量和页面构建号，不输出 Cookie。以后用返回的账号 ID 更新原记录，避免重复添加：
 
-## 致谢
-- [Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api/)(上游 Python 版,功能基准)
-- [one880808/gemini-web2api](https://github.com/one880808/gemini-web2api)(本仓库的早期 fork 来源)
-- [linux.do](https://linux.do) 社区
+```powershell
+$account = Read-Host '上次导入返回的 acc_ 账号 ID'
+node scripts/sync-roxy.mjs --origin $env:GATEWAY_URL --cdp $cdp --account $account
+```
 
-## License
-MIT
+打开部署根地址即可访问管理台；API 客户端 Base URL 为部署地址加 `/v1`，使用 `API_KEY`，不要使用 `ADMIN_KEY`。
+
+## 调用示例
+
+以下 PowerShell 命令接续上面的环境变量：
+
+```powershell
+$body = @{
+  model = 'gemini-3.6-flash'
+  messages = @(@{role='user'; content='只回复 OK'})
+  stream = $false
+} | ConvertTo-Json -Depth 8
+Invoke-RestMethod "$env:GATEWAY_URL/v1/chat/completions" -Method Post `
+  -Headers @{Authorization="Bearer $env:API_KEY"} `
+  -ContentType 'application/json' -Body $body
+```
+
+模型列表是协议适配器清单，**不是账号权益探测或成功承诺**。响应扩展字段 `gemini.actual_model` 取自上游实际模型描述，缺失则为 null。详细端点、会话和限制见 [API 使用](docs/api.md)。
+
+## 免费额度不是无限额度
+
+按 2026-10-05 查询的 Cloudflare 文档：
+
+| 资源        | Free 额度 / 约束                                                  |
+| ----------- | ----------------------------------------------------------------- |
+| Workers     | 100,000 请求/天；每次调用 10 ms CPU；等待网络不计 CPU             |
+| SQLite DO   | 100,000 请求/天、13,000 GB-s/天；流式连接和后台任务会消耗持续时间 |
+| D1          | 500 万行读取/天、10 万行写入/天、总存储 5 GB                      |
+| Browser Run | 10 分钟浏览器时间/天、最多 3 并发；本实现不依赖它                 |
+
+以上额度按 Cloudflare 账号共享，不是每个 Gemini 账号独享；DO SQLite 还存在独立行读写和存储限制。清理、索引、管理接口、Cookie 续期也占额度。大请求可能先触发 CPU 限制。超限会失败；部署脚本不自动升级付费方案。Gemini 本身的使用资格和额度仍由 Google 决定。
+
+来源：[Workers](https://developers.cloudflare.com/workers/platform/pricing/)、[DO](https://developers.cloudflare.com/durable-objects/platform/pricing/)、[D1](https://developers.cloudflare.com/d1/platform/pricing/)、[Browser Run](https://developers.cloudflare.com/browser-run/pricing/)。
+
+## 开发与维护
+
+```powershell
+npm run check
+npm test
+npm run format:check
+npm run build
+```
+
+`npm run build` 只打包 dry-run，不发布。CI 不需要真实 Google Cookie 或 Cloudflare 密钥。集成测试在 workerd 中运行 SQLite DO 和 D1，Google 传输为模拟响应。`tests/harness.ts` 只用于测试，不进入部署包。
+
+- [架构与数据保留](docs/architecture.md)
+- [API 使用与兼容范围](docs/api.md)
+- [部署、密钥、故障排查、迁移与回滚](docs/operations.md)
+- [当前验收结果](docs/verification.md)
+
+## 协议来源与许可
+
+协议字段参考 `gemini-web2api-go` 提交 `2158ea0bce6f5ae9cd7e8e9c04d4fd58b7986195`，保留其 MIT 声明，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。本项目与 Google、Cloudflare 均无官方关系；只用于自己拥有或获授权的账号，并遵守服务条款。使用网页非公开协议存在随时失效、账号受限和数据外发给 Google 的风险。

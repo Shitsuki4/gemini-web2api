@@ -1,41 +1,40 @@
-name = "gemini-web2api"
-main = "worker.js"
-compatibility_date = "2025-01-01"
+name = "gemini-web2api-native"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+workers_dev = true
 
-# 运行时状态:cookie / bl / xsrf 热更新(不用重新部署)
-[[kv_namespaces]]
-binding = "STATE"
-id = "80535d8c9ed94ec4a97d669848d3fbf7"
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/admin/*", "/v1/*", "/v1beta/*", "/healthz"]
 
-# 多模态文件引用缓存(file_cache 表)
 [[d1_databases]]
 binding = "DB"
-database_name = "gemini-router-db"
-database_id = "ebaf9b4e-9ec1-4a52-a37a-3905f8267c50"
+database_name = "gemini-web2api-v3"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
 
-# 多模态输入图片的文件引用缓存(img:<acct>:<sha256>)。未绑定时会退回 D1 的 file_cache 表。
-[[r2_buckets]]
-binding = "FILECACHE"
-bucket_name = "gemini-web2api-images"
-
-# 每 6 小时:抓一次 Gemini 首页,把滚动更新的 __Secure-1PSIDTS/SNlM0e/bl 写回 KV;
-# 同时跑一轮出口纯净度测试(选出口用分数排序)。
-[triggers]
-crons = ["7 */6 * * *"]
-
-[observability]
-enabled = true
-
-# 把 worker 调度到离上游(gemini.google.com)更近的机房:出口 IP 不再是本地
-# 就近的香港机房,文本生成在欧美机房更稳。
-[placement]
-mode = "smart"
-
-# Regional Durable Object relay: locationHint chooses a non-HK egress region.
 [[durable_objects.bindings]]
-name = "EGRESS"
-class_name = "EgressRelay"
+name = "ACCOUNTS"
+class_name = "GeminiAccount"
 
+# Retain the old deployment's migration history. EgressRelay is retired in v2.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["EgressRelay"]
+[[migrations]]
+tag = "v2"
+deleted_classes = ["EgressRelay"]
+new_sqlite_classes = ["GeminiAccount"]
+
+[vars]
+DEFAULT_MODEL = "gemini-3.6-flash"
+MAX_ACCOUNTS = "5"
+MAX_REQUEST_BYTES = "1048576"
+REQUEST_TIMEOUT_MS = "180000"
+SESSION_TTL_SECONDS = "604800"
+# "auto" is normal placement; regional hints are best-effort, not an IP guarantee.
+ACCOUNT_LOCATION_HINT = "wnam"
+
+[observability]
+enabled = false

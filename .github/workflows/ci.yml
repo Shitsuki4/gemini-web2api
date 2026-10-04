@@ -1,30 +1,20 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-
+name: Verify Cloudflare rewrite
+on: [push, pull_request]
 permissions:
   contents: read
-
 jobs:
-  test:
-    name: syntax + unit tests (node ${{ matrix.node-version }})
+  verify:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-      - name: Syntax check
-        run: |
-          node --check worker.js
-          node --check proxy/worker.js
-      - name: Unit tests
-        run: npm test
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+        env:
+          WRANGLER_SEND_METRICS: "false"

@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Gemini · Cloudflare Console</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <aside>
+      <a class="brand" href="/"
+        >✦ <span>Gemini <small>WEB TO API</small></span></a
+      >
+      <div class="tag">CLOUDFLARE NATIVE / V3</div>
+      <nav>
+        <button data-page="overview" class="active">概览 <span>01</span></button
+        ><button data-page="accounts">账号池 <span>02</span></button
+        ><button data-page="keys">API 密钥 <span>03</span></button
+        ><button data-page="requests">请求记录 <span>04</span></button
+        ><button data-page="playground">调试台 <span>05</span></button
+        ><button data-page="settings">运行配置 <span>06</span></button>
+      </nav>
+      <footer>
+        Workers + Durable Objects + D1<br />无需外部服务器 · 无 R2 依赖
+      </footer>
+    </aside>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">YOUR GEMINI, AT THE EDGE</div>
+          <h1 id="heading">服务概览</h1>
+        </div>
+        <button id="refresh" class="secondary">刷新数据 ↻</button>
+      </header>
+      <div id="notice" role="status" hidden></div>
+      <section id="login" class="card">
+        <div>
+          <h2>连接管理控制台</h2>
+          <p>
+            输入
+            ADMIN_KEY。密钥仅保留在本页内存中，刷新即清除，不写入浏览器存储。
+          </p>
+        </div>
+        <form id="login-form" class="inline">
+          <input
+            id="admin-key"
+            type="password"
+            autocomplete="off"
+            placeholder="Admin key"
+            required
+            minlength="24"
+          /><button>连接 →</button>
+        </form>
+      </section>
+      <section id="overview" class="page">
+        <div class="metrics">
+          <article class="card">
+            <label>近 24 小时请求</label><strong id="request-count">—</strong>
+          </article>
+          <article class="card">
+            <label>失败请求</label><strong id="failure-count">—</strong>
+          </article>
+          <article class="card">
+            <label>平均耗时</label><strong id="duration">—</strong>
+          </article>
+        </div>
+        <article class="hero card">
+          <div class="eyebrow">BUILT FOR THE FREE TIER</div>
+          <h2>网页协议，<br />原生运行在 Cloudflare。</h2>
+          <p>
+            独立账号会话、加密
+            Cookie、真实上游流式响应。没有本地保活进程，没有偷偷调用官方付费
+            API。
+          </p>
+          <div class="pills">
+            <span>OpenAI Chat</span><span>Responses</span
+            ><span>图片 / 音乐 / Canvas</span><span>异步视频</span>
+          </div>
+        </article>
+        <article class="card warning">
+          <h3>可用性边界</h3>
+          <p>
+            Google 可能拒绝数据中心出口，Cookie
+            自动续期也可能受设备绑定限制。媒体能力取决于你的 Gemini
+            账号权益。模型清单不是权益保证；以实际响应模型为准。
+          </p>
+        </article>
+      </section>
+      <section id="accounts" class="page" hidden>
+        <div class="section-head">
+          <h2>独立账号，独立会话</h2>
+          <span>Cookie 在 Durable Object 中 AES-GCM 加密</span>
+        </div>
+        <form id="account-form" class="card form">
+          <label
+            >账号名称<input
+              name="label"
+              placeholder="例如：Roxy 主账号"
+              required
+              maxlength="80" /></label
+          ><label
+            >完整 Cookie<textarea
+              name="cookie"
+              rows="3"
+              placeholder="__Secure-1PSID=…; __Secure-1PSIDTS=…"
+              required
+              autocomplete="off"
+              spellcheck="false"
+            ></textarea>
+          </label>
+          <p>
+            推荐用仓库的 sync-roxy 脚本导入 Cookie
+            和页面参数，避免手工遗漏。管理 API 不提供 Cookie 导出。
+          </p>
+          <button>添加账号</button>
+        </form>
+        <div id="account-list" class="list"></div>
+      </section>
+      <section id="keys" class="page" hidden>
+        <form id="key-form" class="card inline">
+          <input
+            name="name"
+            placeholder="客户端名称"
+            required
+            maxlength="80"
+          /><button>创建 API Key</button>
+        </form>
+        <div id="new-key" class="card" hidden>
+          <h3>只显示一次，请妥善保存</h3>
+          <code id="key-value"></code
+          ><button id="hide-key" class="secondary">已保存，隐藏</button>
+        </div>
+        <div id="key-list" class="list"></div>
+      </section>
+      <section id="requests" class="page" hidden>
+        <div class="card">
+          <h2>最近 100 条请求</h2>
+          <p>
+            不记录提示词、回复正文或 Cookie。工具、JSON
+            格式和上游流式错误计为失败。
+          </p>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>请求模型</th>
+                  <th>实际模型</th>
+                  <th>状态</th>
+                  <th>耗时</th>
+                  <th>错误代码</th>
+                </tr>
+              </thead>
+              <tbody id="request-list"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      <section id="playground" class="page" hidden>
+        <form id="chat-form" class="card form">
+          <div class="two">
+            <label
+              >API Key（不是管理密钥）<input
+                id="chat-key"
+                type="password"
+                autocomplete="off"
+                required /></label
+            ><label
+              >模型<select id="model">
+                <option>gemini-3.6-flash</option>
+                <option>gemini-3.1-pro</option>
+                <option>gemini-3.8-flash</option>
+                <option>gemini-3.6-flash-thinking</option>
+                <option>gemini-image</option>
+                <option>gemini-music</option>
+                <option>gemini-canvas</option>
+              </select></label
+            >
+          </div>
+          <label
+            >消息<textarea
+              id="prompt"
+              rows="4"
+              placeholder="向 Gemini 发送一条消息…"
+              required
+            ></textarea>
+          </label>
+          <div class="inline">
+            <button id="send">发送，真实流式 →</button
+            ><button id="reset-session" class="secondary" type="button">
+              新会话</button
+            ><button id="stop" class="secondary" type="button" disabled>
+              停止
+            </button>
+          </div>
+          <p id="session-info">新会话。后续只发送新增消息。</p>
+        </form>
+        <article class="card answer">
+          <div class="eyebrow">UPSTREAM RESPONSE</div>
+          <pre id="answer">等待发送请求。</pre>
+        </article>
+      </section>
+      <section id="settings" class="page" hidden>
+        <article class="card">
+          <h2>运行边界与配置</h2>
+          <p>部署参数通过 Worker 环境变量配置。此处不会显示任何凭证。</p>
+          <pre id="config"></pre>
+        </article>
+        <article class="card">
+          <h3>接入地址</h3>
+          <code id="base-url"></code>
+          <p>
+            OpenAI 客户端 Base URL 使用上方地址，认证使用 API
+            Key。管理员与调用方密钥分离。
+          </p>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>

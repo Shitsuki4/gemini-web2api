@@ -1,0 +1,69 @@
+# 运维、迁移与回滚
+
+## 首先判断是否真的可用
+
+`/healthz`、模型清单和成功导入 Cookie 都不能证明生成可用。用 `npm run smoke` 发出一次真实文本请求；成功必须拿到非空答案。失败时脚本以非零退出，输出状态/错误码，不打印 Cookie 或密钥。不要批量重试验证页，也不要把模型列表当验收结果。
+
+| 错误码 / 情况                             | 含义与处理                                                                   |
+| ----------------------------------------- | ---------------------------------------------------------------------------- |
+| `egress_blocked`                          | Google 重定向至 `/sorry`；停止盲目重试。这不是 Cookie 导入成功即可解决的问题 |
+| `login_expired`                           | 跳到登录页或无法取得页面令牌；在 Roxy 人工确认登录后更新原账号               |
+| `refresh_no_ticket`                       | 轮换没有返回新票据；可能为设备绑定/不可移植会话，需要重新导入                |
+| `upstream_redirect`                       | 未被允许自动跟随的跳转；只报告目标主机，不泄漏查询参数                       |
+| `upstream_http_429`                       | 上游限流；不要立即重放生成                                                   |
+| `account_busy` / `pool_busy`              | 账号串行锁占用，客户端应退避                                                 |
+| `account_rate_limit`                      | 每账号每分钟 6 次尝试的本地保护；失败尝试也计数                              |
+| `session_expired` / 404                   | 会话过期、不存在或不是当前 Key 的资源；新开会话                              |
+| `submission_uncertain`                    | 视频提交中断，可能已消耗上游额度；不自动重复提交                             |
+| `invalid_json_response` / `tool_required` | Gemini 未遵守提示词模拟的输出要求，不伪造结果                                |
+| Cloudflare 1102 / D1/DO quota error       | 可能触发免费 CPU/读写/持续时间等限制，不能用自动升级付费解决                 |
+
+位置 hint 只是 Cloudflare 的放置建议，不保证国家/IP，也不是绕过 Google 拦截的能力。Browser Run 也会标识为机器人，免费 10 分钟/天，本项目不将其作为已验证后备方案。
+
+## 密钥管理
+
+- `ADMIN_KEY`：至少 24 字符，仅管理端使用。
+- `API_KEY`：可选初始客户端密钥；也可在管理台创建独立 Key。
+- `ENCRYPTION_KEY`：base64 编码的 32 字节随机数；不是普通密码。
+- `.local/secrets.json` 是本机私密文件。Windows 下 Node 的 mode 位不能替代 NTFS ACL，使用者应限制目录访问；不要将文件放入公开同步目录、截图或附件。
+- 用户此前在聊天中明文粘贴过的 GitHub/Cloudflare 凭据应撤销并重发。项目不需要把这些部署凭据存为运行时秘密。
+
+**不能直接替换 ENCRYPTION_KEY。** 旧 DO 密文将无法解密，连账号加载都可能失败。当前无自动重加密迁移：先备份旧密钥，在旧密钥仍有效时删除导入账号，再替换密钥并重新导入；或部署独立新实例，验收后再切换。这样会丢失本地会话/媒体/任务元数据，不删除 Google 侧会话。
+
+## 无 Cron 的维护
+
+启用账号通过 DO Alarm 约每 15 分钟尝试轮换 Cookie并清理状态；视频期间更频繁轮询。停用账号不生成/续期，低频维护数据。Alarm 时机不是精确计时 SLA，平台重试或繁忙会延迟。默认配置没有 Cron，因此不会删除或占用账号已有的 Cron 任务。
+
+请求元数据 30 天、统计 365 天。若已删除最后一个账号，无 Alarm 继续清理 D1，可手动执行以下**明确删除过期日志**的命令：
+
+```powershell
+npx wrangler d1 execute DB --remote --command "DELETE FROM requests WHERE created_at < unixepoch() - 2592000; DELETE FROM daily_stats WHERE day < date('now','-365 days');"
+```
+
+请求日志不含正文；计数涵盖进入生成阶段的完成尝试和完成/失败的视频任务，不是所有 HTTP 请求。鉴权、验证、忙碌拒绝和异常中断未完成的日志可能不计入，监控不可据此计费。
+
+## 旧版迁移
+
+这是破坏性代码重构，不是旧 `worker.js` 的兼容补丁。
+
+1. 保留旧 main、旧 Worker、旧 D1/KV/R2 和旧秘密。不要把旧 `.dev.vars` 当新配置使用。
+2. 新建 `gemini-web2api-native` 和单独的 `gemini-web2api-v3` D1；配置中的 v1/v2 DO 迁移历史与旧项目保持一致。
+3. 新建三类秘密、应用新 D1 schema、导入 Roxy 账号；不自动复制旧 plaintext Cookie/会话/记忆。
+4. 真实文本/流式/连续会话/目标媒体能力全部验证后，才由维护者决定切换客户端 Base URL。
+5. **当前真实生成失败，因此没有执行旧线上服务替换。** 本次代码留在独立重构分支。
+
+不要随意把新配置的 Worker 名称改回旧名称后 deploy：v2 迁移包含退役 `EgressRelay`，可能删除旧 DO 数据。代码回滚不能恢复已删除的 DO 类和数据。
+
+删除的旧功能包括外部代理/出口池、R2 路径、自动归组、长期记忆和旧版假定兼容接口。新旧配置、会话 ID 及 API 参数不是直接兼容的。
+
+## 回滚
+
+由于新部署完全独立，回滚是让客户端继续指向旧 Base URL；旧 Worker 与资源未改动。重构分支可保留，原 main 的 `cf94c7d` 是此次工作的起点。不执行 force-push 或重写旧历史。
+
+如果要停用测试实例，先在管理台停用/删除导入账号，避免后台 Alarm 继续尝试续期；再按自己的资源保留要求删除新 Worker 和新 D1。不要删除名称相近的旧资源。
+
+## 本地开发
+
+建立 `.dev.vars`，只放 ADMIN_KEY、API_KEY、ENCRYPTION_KEY；具体值使用开发专用密钥，不要复制生产 Cookie 到测试夹具。然后执行 `npm run db:local` 和 `npm run dev`。已有 `.dev.vars` 不会被初始化脚本覆盖，需要自行确认它属于新版本。
+
+`npm test` 使用独立内存数据库和假的 Google 响应，不需要 `.dev.vars`。不要将 `tests/harness.ts` 设为生产入口；`wrangler.toml` 始终指向 `src/index.ts`。
