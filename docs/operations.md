@@ -20,6 +20,12 @@
 
 位置 hint 只是 Cloudflare 的放置建议，不保证国家/IP，也不是绕过 Google 拦截的能力。Browser Run 也会标识为机器人，免费 10 分钟/天，本项目不将其作为已验证后备方案。
 
+### `gemini-image` 返回 `media_unavailable`
+
+先看错误中的 `Upstream reply`，不要仅凭“无下载产物”就认定账号没有生图权限。若同时出现 `login_expired`，在 Roxy 确认登录后，用 `sync-roxy --account 原账号ID` 更新原账号，避免新增重复账号/旧会话失配。之后用 `npm run smoke:image-chat` 验证一次真实 Chat SSE 生图和下载；不要连续无界重试。
+
+调试台更新后需刷新网页。如果接口已返回图片而页面不显示，检查图片文件请求的状态及静态资源 `_headers` 中的 `img-src ... blob:`。Worker 头和静态资源头必须一致，已有回归测试。自动 Cookie 续期仍是最佳努力，不承诺永久有效。
+
 ## 传输配置
 
 `UPSTREAM_TRANSPORT=socket` 是实际已验收的默认链路，使用 Cloudflare 原生 TLS sockets，不依赖外部中转。`fetch` 仅供明确切换进行诊断，没有自动 fallback。协议层仅在 HTTP 400 时刷新页面令牌并重试一次；429、验证页和不确定提交不自动重放。

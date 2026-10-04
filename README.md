@@ -91,6 +91,8 @@ Invoke-RestMethod "$env:GATEWAY_URL/v1/chat/completions" -Method Post `
 
 `npm run smoke:media` 可另测 txt 附件和图片生成/下载（2 次生成，会消耗图片权益）；返回的是需原 API Key 的网关下载地址，不是公开图片链接。
 
+`npm run smoke:image-chat` 专测调试台使用的 Chat SSE 生图和鉴权下载（1 次生成，默认中文提示，可用 `IMAGE_PROMPT` 覆盖）。调试台现支持图片预览/下载；失败会显示上游的可见说明，不再一律提示检查图片权限。
+
 ## 免费额度不是无限额度
 
 按 2026-10-05 查询的 Cloudflare 文档：

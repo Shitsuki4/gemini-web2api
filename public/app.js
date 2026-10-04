@@ -1,4 +1,5 @@
-"use strict";
+import { artifactGallery } from "./media.js";
+const gallery = artifactGallery(document.getElementById("artifacts"));
 const $ = (id) => document.getElementById(id);
 let adminKey = "",
   page = "overview",
@@ -234,11 +235,13 @@ $("chat-form").onsubmit = async (e) => {
   $("send").disabled = true;
   $("stop").disabled = false;
   $("answer").textContent = "";
+  gallery.clear();
+  const inferenceKey = $("chat-key").value;
   try {
     const r = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: "Bearer " + $("chat-key").value,
+        Authorization: "Bearer " + inferenceKey,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -275,6 +278,12 @@ $("chat-form").onsubmit = async (e) => {
         const b = JSON.parse(data);
         if (b.error) throw Error(b.error.message);
         $("answer").textContent += b.choices?.[0]?.delta?.content || "";
+        if (b.gemini?.artifacts?.length)
+          await gallery.show(
+            b.gemini.artifacts,
+            inferenceKey,
+            controller.signal,
+          );
         if (b.gemini?.actual_model)
           notify("实际模型：" + b.gemini.actual_model);
       }

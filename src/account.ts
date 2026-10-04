@@ -21,6 +21,7 @@ import {
 import { GeminiClient, validateCookie } from "./gemini/client";
 import { socketTransport } from "./gemini/socket";
 import { delta } from "./gemini/protocol";
+import { cleanMediaText, missingArtifactMessage } from "./media";
 import { chatResponse, finishResult, responsesResponse } from "./api";
 import { eventStream, type EventSink } from "./sse";
 interface VideoJob {
@@ -688,8 +689,9 @@ export class GeminiAccount implements DurableObject {
       throw new ApiError(
         502,
         "media_unavailable",
-        "Gemini did not return a downloadable artifact. Check account entitlement and prompt restrictions.",
+        missingArtifactMessage(input.model, result.text),
       );
+    result.text = cleanMediaText(result.text);
     result.artifacts = [];
     for (const url of result.urls.slice(0, 4)) {
       const a = await this.storeArtifact(

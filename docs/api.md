@@ -110,6 +110,14 @@ JSON 模式仅 `response_format:{"type":"json_object"}`；Responses 可用 `text
 - 视频：`POST /v1/videos`，`{"prompt":"一段海浪视频","model":"gemini-video"}`，随后查询返回的完整 ID。状态 queued / in_progress / completed / failed。默认 10 分钟任务超时，24 小时作业 TTL；内容地址通常 1 小时过期。
 - 不支持指定图片 size/quality/style/output_format 或视频 seconds/input_reference；不模拟这些参数生效。
 
+### 聊天生图、预览和错误
+
+`gemini-image` 也可通过 `/v1/chat/completions` 使用，包括 `stream:true`。媒体生成先缓冲，成功时发送下载链接和 `gemini.artifacts`，最后才发送 `[DONE]`；不能把 HTTP 200 的 SSE 握手当成图片已生成。没有媒体时发送 `event: error`，不伪造成功终止。
+
+管理台使用原调用 API Key 的 Authorization 头获取文件，生成本地 Blob 预览和下载按钮；不把 Key 放入 URL，不把 Google 签名 URL 暴露给浏览器，也不跟随外部重定向。网页预览限 20 MiB，仅接受 PNG/JPEG/WebP/GIF 及指定音频 MIME，不执行 HTML/SVG。下载的 `Content-Type` 才是实际格式；`gemini.artifacts[].mime` 当前只是类型提示，图片实际可能是 JPEG 而非 PNG。
+
+`media_unavailable` 仅说明未获取到可下载媒体。错误的 `Upstream reply` 保留上游可见回复摘要（最多 600 字符，URL 已移除），不会包含私有推理或整包协议数据，也不会写入请求日志。没有上游解释时不猜测原因。实际配额、提示限制、会话失效或协议变化需按证据区分；不会自动重放生成。
+
 ## 管理端点
 
 | 路径                           | 方法                                                 |

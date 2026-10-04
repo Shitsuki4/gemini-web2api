@@ -134,6 +134,16 @@ describe("actual workerd + SQLite DO + D1 integration", () => {
     const r = await mf.dispatchFetch("https://gateway.test/v1/models");
     expect(r.status).toBe(401);
   });
+  it("keeps the Worker and static-asset CSP aligned for blob media previews", async () => {
+    const r = await mf.dispatchFetch("https://gateway.test/v1/models");
+    const staticHeaders = await readFile("public/_headers", "utf8");
+    const csp = staticHeaders.match(/Content-Security-Policy: (.+)/)![1].trim();
+    expect(r.headers.get("content-security-policy")).toBe(csp);
+    expect(csp).toContain("img-src 'self' data: blob:");
+    expect(csp).toContain("media-src 'self' blob:");
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toContain("unsafe-inline");
+  });
   it("separates admin and inference credentials", async () => {
     expect((await req("/admin/accounts")).status).toBe(401);
     expect((await req("/v1/models", undefined, admin)).status).toBe(401);
@@ -339,6 +349,47 @@ describe("state lifecycle in workerd", () => {
       await db.prepare("SELECT id FROM requests WHERE id='expired'").first(),
     ).toBeNull();
     expect((await storage(stub))["known:legacy"]).toBeUndefined();
+  });
+  it("returns actual visible media failure in SSE, without claiming success", async () => {
+    await freshAccount();
+    const r = await req("/v1/chat/completions", {
+      model: "gemini-image",
+      stream: true,
+      messages: [{ role: "user", content: "draw" }],
+    });
+    const text = await r.text();
+    expect(text).toContain("event: error");
+    expect(text).toContain("media_unavailable");
+    expect(text).toContain("Upstream reply: Hello runtime");
+    expect(text).not.toContain("[DONE]");
+    expect(text).not.toContain('"finish_reason":"stop"');
+  });
+  it("returns downloadable artifacts for the chat SSE image route", async () => {
+    await freshAccount();
+    returnMedia = true;
+    try {
+      const r = await req("/v1/chat/completions", {
+        model: "gemini-image",
+        stream: true,
+        messages: [{ role: "user", content: "画一只可爱小猫" }],
+      });
+      const text = await r.text();
+      expect(lastPayload[49]).toBe(14);
+      expect(text).toContain("[DONE]");
+      expect(text).toContain('"artifacts":[{"id":"acc_');
+      expect(text).not.toContain("https://lh3.googleusercontent.com");
+      const id = JSON.parse(
+        text
+          .split("\n")
+          .find((line) => line.includes('"artifacts"'))!
+          .slice(6),
+      ).gemini.artifacts[0].id;
+      expect(await (await req(`/v1/files/${id}/content`)).text()).toBe(
+        "IMAGE_BYTES",
+      );
+    } finally {
+      returnMedia = false;
+    }
   });
   it("isolates artifact access and drives video completion with a DO alarm", async () => {
     const { stub } = await freshAccount();

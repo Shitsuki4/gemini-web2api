@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Gemini · Cloudflare Console</title>
     <link rel="stylesheet" href="/style.css" />
-    <script src="/app.js" defer></script>
+    <script src="/app.js" type="module"></script>
   </head>
   <body>
     <aside>
@@ -200,6 +200,7 @@
         <article class="card answer">
           <div class="eyebrow">UPSTREAM RESPONSE</div>
           <pre id="answer">等待发送请求。</pre>
+          <div id="artifacts" aria-live="polite"></div>
         </article>
       </section>
       <section id="settings" class="page" hidden>
