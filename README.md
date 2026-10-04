@@ -4,6 +4,8 @@
 
 > **当前状态：纯 Cloudflare 文本链路已通过真实验收。** 2026-10-05 在 Workers Free + SQLite DO + D1 上，原生 TLS socket 传输已完成非流式回答、只传会话 ID 的第二轮续聊、11 个文本增量的 SSE、Responses JSON、txt 附件读取及图片生成/下载。不是模拟上游，也没有经过 Roxy 中转。之前 fetch 路径遭遇 Google 验证的结论已被这个实测修正。**音乐/视频等其它媒体及长期 Cookie 续期仍须分别验收，不承诺 Go 项目全部功能等价或长期稳定。** 详见[验收报告](docs/verification.md)与[参考项目对照](docs/references.md)。
 
+> **Spark 新增为 Beta 实验入口，不是已验收能力。** 使用 `gemini-spark`；已实现真实 Spark tool 40、任务续接和答案事件解析，但当前 Cloudflare 实测仍有 `1061` / 无答案终止，网页适配器成功不等于云端成功。普通 Gemini 与图片链路不因此改为 Spark。见 [Spark 使用范围](docs/api.md#spark-beta实验性文本适配) 和[失败记录](docs/verification.md#spark-beta-追加验收2026-10-05)。
+
 ## 能做什么
 
 | 功能             | 本实现                                                       | 验证边界                                                                  |
@@ -14,6 +16,7 @@
 | 账号池           | 每账号一个 DO，串行生成、6 次尝试/分钟、冷却、最久未使用优先 | 不提供 IP 池或地区解锁保证                                                |
 | 文件输入         | base64 data URL，最多 4 个附件                               | 单文件 768 KiB，整个请求 1 MiB；拒绝远程文件 URL                          |
 | 图片/音乐/Canvas | 网页工具开关和鉴权下载代理                                   | 图片已实测生成/下载；音乐、Canvas 未真实验收                              |
+| Spark Beta       | `gemini-spark`，独立协议、加密任务游标、仅文本实验入口       | **Cloudflare 真实验收未通过**，不承诺可用；非调度/关联应用 API            |
 | 视频             | 提交作业、DO Alarm 轮询、状态/鉴权下载                       | 实验性，10 分钟超时，不自动重放不确定的提交                               |
 | 函数工具 / JSON  | 提示词模拟工具调用；JSON object 输出解析检查                 | 非原生函数协议，不执行工具，不保证遵守提示词，拒绝 strict schema          |
 | Google API       | 基础非流式 `generateContent`                                 | 只做文本/inlineData 适配，不支持完整 generationConfig、安全设置或原生流式 |
@@ -111,6 +114,8 @@ npm test
 npm run format:check
 npm run build
 ```
+
+`npm run smoke:spark` 消耗最多 4 次真实 Spark 生成，测试文本、续聊、SSE、Responses；任一失败非零退出。它不会用普通 Gemini 或浏览器中转伪造 Spark 成功。
 
 `npm run build` 只打包 dry-run，不发布。CI 不需要真实 Google Cookie 或 Cloudflare 密钥。集成测试在 workerd 中运行 SQLite DO 和 D1，Google 传输为模拟响应；socket 单元测试注入模拟连接，真实连接由独立线上验收覆盖。`npm run smoke` 会消耗 4 次真实生成：非流式、续聊、SSE 和 Responses，任一失败均非零退出。`tests/harness.ts` 只用于测试，不进入部署包。
 

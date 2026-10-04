@@ -29,9 +29,15 @@ export interface Credentials {
   pushId?: string;
   pctx?: string;
   fetchedAt?: number;
+  tokenSurface?: "app" | "spark";
   refreshedAt?: number;
 }
+export interface SparkContext {
+  conversationId: string;
+  cursor?: string;
+}
 export interface Session {
+  sparkContext?: SparkContext;
   metadata: unknown[];
   turn: number;
   updatedAt: number;
@@ -43,6 +49,7 @@ export interface Model {
   mode: number;
   thinking?: boolean;
   tool?: number;
+  spark?: boolean;
 }
 export interface InputFile {
   data: string;
@@ -75,6 +82,7 @@ export interface Artifact {
   expiresAt: number;
 }
 export interface Result {
+  sparkContext?: SparkContext;
   text: string;
   actualModel: string;
   metadata: unknown[];

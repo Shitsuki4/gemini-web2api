@@ -9,6 +9,7 @@ import { ApiError, fromBase64, hex, now, readLimited } from "../util";
 import { modelHeader, payload, resolveModel } from "./models";
 import {
   absorb,
+  absorbSpark,
   decodeEnvelope,
   emptyResult,
   envelopeLines,
@@ -144,15 +145,16 @@ export class GeminiClient {
     }
     return r;
   }
-  async tokens(force = false) {
+  async tokens(force = false, surface: "app" | "spark" = "app") {
     if (
       !force &&
       this.credentials.xsrf &&
       this.credentials.bl &&
+      (this.credentials.tokenSurface || "app") === surface &&
       now() - (this.credentials.fetchedAt || 0) < 1200
     )
       return;
-    const r = await this.send(ORIGIN + "/app", {
+    const r = await this.send(ORIGIN + "/" + surface, {
       headers: { Accept: "text/html" },
     });
     if (r.status >= 300 && r.status < 400) {
@@ -176,7 +178,7 @@ export class GeminiClient {
         "login_expired",
         "Gemini did not return signed-in page tokens. Re-import the login; device-bound cookies may not be portable.",
       );
-    Object.assign(this.credentials, tokens);
+    Object.assign(this.credentials, tokens, { tokenSurface: surface });
     await this.save();
   }
   async headers() {
@@ -249,8 +251,27 @@ export class GeminiClient {
     session: Session | undefined,
     onText?: (text: string) => Promise<void>,
   ): Promise<Result> {
-    await this.tokens();
     const model = resolveModel(input.model);
+    if (
+      model.spark &&
+      (input.files.length ||
+        input.tools?.length ||
+        (input.responseFormat &&
+          (input.responseFormat as { type?: string }).type !== "text") ||
+        !["chat", "responses", "google"].includes(input.endpoint))
+    )
+      throw new ApiError(
+        400,
+        "spark_text_only",
+        "Spark currently supports text chat/Responses only, without attachments, function tools or structured output",
+      );
+    if (model.spark && session && !session.sparkContext)
+      throw new ApiError(
+        409,
+        "spark_context_missing",
+        "Spark continuation context is missing; start a new session",
+      );
+    await this.tokens(false, model.spark ? "spark" : "app");
     const refs = [];
     for (const file of input.files) {
       const ref = await this.upload(file);
@@ -268,14 +289,19 @@ export class GeminiClient {
     }
     const uuid = crypto.randomUUID(),
       data = payload(
-        input.prompt,
+        model.spark
+          ? "[API scope: text replies only. Do not browse, use tools, access files or connected apps, schedule tasks, or take external actions. If the request requires those capabilities, explain the limitation instead.]\n\n" +
+              input.prompt
+          : input.prompt,
         model,
         uuid,
         session?.metadata,
         session?.turn || 0,
         refs,
+        session?.sparkContext,
       );
     const h = await this.headers();
+    if (model.spark) h.set("Referer", ORIGIN + "/spark");
     h.set("x-goog-ext-525001261-jspb", modelHeader(model, crypto.randomUUID()));
     h.set("x-goog-ext-525005358-jspb", JSON.stringify([uuid, 1]));
     const endpoint = () =>
@@ -299,7 +325,7 @@ export class GeminiClient {
     });
     if (r.status === 400) {
       await r.body?.cancel();
-      await this.tokens(true);
+      await this.tokens(true, model.spark ? "spark" : "app");
       r = await this.send(endpoint(), {
         method: "POST",
         headers: h,
@@ -318,22 +344,45 @@ export class GeminiClient {
       );
     const result = emptyResult();
     let bardCode = "";
+    let sparkCompleted = false;
+    let frameCount = 0;
+    const sparkEvents = new Set<string>();
     for await (const line of envelopeLines(r.body)) {
       const m = line.match(/BardErrorInfo[^0-9]{0,40}(\d{3,5})/);
       if (m) bardCode = m[1];
       for (const frame of decodeEnvelope(line)) {
+        frameCount++;
+        if (model.spark && frame?.[2] && typeof frame[2] === "object")
+          for (const k of Object.keys(frame[2]))
+            if (/^\d{1,3}$/.test(k)) sparkEvents.add(k);
         const previous = result.text;
-        absorb(result, frame);
+        if (model.spark)
+          sparkCompleted = absorbSpark(result, frame) || sparkCompleted;
+        else absorb(result, frame);
         if (onText && result.text !== previous) await onText(result.text);
       }
     }
+    if (model.spark && bardCode)
+      throw new ApiError(
+        502,
+        `gemini_${bardCode}`,
+        `Gemini rejected the Spark task (code ${bardCode}); any partial answer is not a successful completion.`,
+      );
     if (!result.text && !result.urls.length && !result.canvas)
       throw new ApiError(
         502,
         bardCode ? `gemini_${bardCode}` : "no_content",
         bardCode
           ? `Gemini rejected the request (code ${bardCode}). Verify account entitlement and Cloudflare egress.`
-          : "Gemini returned no answer. The web protocol or login may have changed.",
+          : model.spark
+            ? `Spark returned no answer (frames=${frameCount}; control fields=${[...sparkEvents].sort().join(",")}; task=${!!result.sparkContext}; completed=${sparkCompleted}). No task is automatically replayed.`
+            : "Gemini returned no answer. The web protocol or login may have changed.",
+      );
+    if (model.spark && !sparkCompleted)
+      throw new ApiError(
+        502,
+        "spark_incomplete",
+        "Spark task did not return its completion event; it may still exist upstream. No automatic replay is attempted.",
       );
     return result;
   }

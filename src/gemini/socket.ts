@@ -14,6 +14,9 @@ export type Connector = (
 ) => UpstreamSocket;
 const MAX_HEADERS = 64 * 1024;
 const MAX_LINE = 8192;
+// Gemini /app currently sends a ~21 KiB CSP header. Keep status/chunk lines
+// small, allow bounded 32 KiB header fields, and retain the 64 KiB total cap.
+const MAX_HEADER_LINE = 32 * 1024;
 const MAX_BODY = 256 * 1024 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -156,7 +159,7 @@ export function socketTransport(
       pending = pending.subarray(size);
       return part;
     };
-    const line = async () => {
+    const line = async (max = MAX_LINE) => {
       for (;;) {
         let end = -1;
         for (let i = 0; i + 1 < pending.length; i++)
@@ -165,12 +168,12 @@ export function socketTransport(
             break;
           }
         if (end >= 0) {
-          if (end > MAX_LINE) throw failure("invalid_upstream_framing");
+          if (end > max) throw failure("invalid_upstream_framing");
           const value = decoder.decode(take(end));
           take(2);
           return value;
         }
-        if (pending.length > MAX_LINE || !(await fill()))
+        if (pending.length > max || !(await fill()))
           throw failure("invalid_upstream_framing");
       }
     };
@@ -197,7 +200,7 @@ export function socketTransport(
         status = Number(match[1]);
         responseHeaders = new Headers();
         for (;;) {
-          const value = await line();
+          const value = await line(MAX_HEADER_LINE);
           headerBytes += value.length + 2;
           if (headerBytes > MAX_HEADERS)
             throw failure("upstream_headers_too_large");

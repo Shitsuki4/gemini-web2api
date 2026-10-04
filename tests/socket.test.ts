@@ -146,13 +146,31 @@ describe("native TLS HTTP transport", () => {
     "Bad Header: x",
     " folded",
     "Content-Encoding: br",
-    "X-Long: " + "x".repeat(8200),
+    "X-Long: " + "x".repeat(32768),
   ])
     it("rejects ambiguous/unsupported/oversized headers", async () => {
       const m = mock("HTTP/1.1 200 OK\r\n" + h + "\r\n\r\n");
       await expect(m.fetch(target)).rejects.toThrow();
       expect(m.closed).toBe(1);
     });
+  it("accepts Gemini-sized CSP fields without relaxing chunk-line limits", async () => {
+    const csp = "script-src " + "x".repeat(21000);
+    const m = mock(
+      "HTTP/1.1 200 OK\r\nContent-Security-Policy: " +
+        csp +
+        "\r\nContent-Length: 2\r\n\r\nOK",
+      4096,
+    );
+    const r = await m.fetch(target);
+    expect(r.headers.get("content-security-policy")).toBe(csp);
+    expect(await r.text()).toBe("OK");
+    const bad = mock(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;" +
+        "x".repeat(8200) +
+        "\r\na\r\n0\r\n\r\n",
+    );
+    await expect((await bad.fetch(target)).text()).rejects.toThrow();
+  });
   it("bounds total header bytes", async () => {
     const m = mock(
       "HTTP/1.1 200 OK\r\n" +

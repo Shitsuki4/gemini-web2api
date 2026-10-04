@@ -382,6 +382,9 @@ export class GeminiAccount implements DurableObject {
               if (result.metadata[0]) {
                 await this.privatePut(sessionKey, {
                   metadata: result.metadata,
+                  ...(result.sparkContext
+                    ? { sparkContext: result.sparkContext }
+                    : {}),
                   model: input.model,
                   turn: (session?.turn || 0) + 1,
                   updatedAt: now(),

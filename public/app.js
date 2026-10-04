@@ -221,6 +221,11 @@ $("reset-session").onclick = () => {
 };
 $("model").onchange = () => {
   $("reset-session").click();
+  if ($("model").value === "gemini-spark")
+    notify(
+      "Spark 是实验入口：Cloudflare 真实验收尚未通过，仅测试文本，不用于计划任务或关联应用操作。",
+      true,
+    );
 };
 $("stop").onclick = () => controller?.abort();
 $("chat-form").onsubmit = async (e) => {

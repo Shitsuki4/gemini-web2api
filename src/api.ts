@@ -224,6 +224,18 @@ export function normalize(
       );
     prompt += "\n\nReturn ONLY a valid JSON object, without Markdown fences.";
   }
+  if (
+    resolveModel(model).spark &&
+    (files.length ||
+      tools?.length ||
+      (body.response_format && body.response_format.type !== "text") ||
+      !["chat", "responses", "google"].includes(endpoint))
+  )
+    throw new ApiError(
+      400,
+      "spark_text_only",
+      "Spark currently supports text chat/Responses only, without attachments, function tools or structured output",
+    );
   if (prompt.length > 100000)
     return bad("Prompt including tool definitions exceeds 100,000 characters");
   return {

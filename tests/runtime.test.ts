@@ -7,6 +7,7 @@ let mf: Miniflare;
 let account = "";
 let calls = 0;
 let lastPrompt = "";
+let lastPayload: any[] = [];
 let rejectUpstream = false;
 let returnMedia = false;
 let upstreamGate: Promise<void> | undefined;
@@ -70,7 +71,7 @@ beforeAll(async () => {
     },
     outboundService: async (request) => {
       const url = new URL(request.url);
-      if (url.pathname === "/app")
+      if (["/app", "/spark"].includes(url.pathname))
         return new Response(
           '"SNlM0e":"xsrf_test","cfb2h":"boq_test","qKIAYe":"push_test","Ylro7b":"pctx_test"',
         );
@@ -79,7 +80,28 @@ beforeAll(async () => {
         if (upstreamGate) await upstreamGate;
         if (rejectUpstream) return new Response("blocked", { status: 429 });
         const b = new URLSearchParams(await request.text());
-        lastPrompt = JSON.parse(JSON.parse(b.get("f.req")!)[1])[0][0];
+        lastPayload = JSON.parse(JSON.parse(b.get("f.req")!)[1]);
+        lastPrompt = lastPayload[0][0];
+        if (lastPayload[49] === 40) {
+          const event = (obj: any) =>
+            JSON.stringify([
+              [
+                "wrb.fr",
+                "StreamGenerate",
+                JSON.stringify([
+                  null,
+                  ["c_runtime", "r_runtime"],
+                  { 44: true, ...obj },
+                ]),
+              ],
+            ]) + "\n";
+          return new Response(
+            event({ 7: ["PRIVATE_SPARK_PLAN"] }) +
+              wire("SPARK_OK") +
+              event({ 26: "PRIVATE_SPARK_CURSOR" }) +
+              event({ 46: ["c_runtime", ""] }),
+          );
+        }
         return new Response(
           ")]}'\n42\n" + wire("Hello") + wire("Hello runtime"),
           { headers: { "content-type": "application/json" } },
@@ -417,4 +439,62 @@ describe("concurrency and ambiguous jobs", () => {
       expect(after.activeVideo).toBeUndefined();
     },
   );
+});
+
+describe("Spark persisted sessions in workerd", () => {
+  it("encrypts task cursor, resumes slot 71 and never exposes control events", async () => {
+    const { stub, objectId } = await freshAccount();
+    const body = {
+      model: "gemini-spark",
+      messages: [{ role: "user", content: "SPARK_OK" }],
+    };
+    const first = await req("/v1/chat/completions", body);
+    expect(first.status).toBe(200);
+    const firstText = await first.text();
+    expect(JSON.parse(firstText).choices[0].message.content).toBe("SPARK_OK");
+    expect(firstText).not.toContain("PRIVATE_SPARK");
+    expect(lastPayload[71]).toBeNull();
+    const rows = await storage(stub);
+    expect(JSON.stringify(rows)).not.toContain("PRIVATE_SPARK");
+    const sessionKey = Object.keys(rows).find((k) => k.startsWith("session:"))!;
+    const saved = await unseal<any>(
+      rows[sessionKey],
+      btoa("k".repeat(32)),
+      objectId + ":" + sessionKey,
+    );
+    expect(saved.sparkContext).toEqual({
+      conversationId: "c_runtime",
+      cursor: "PRIVATE_SPARK_CURSOR",
+    });
+    expect(saved.metadata[2]).toBe("rc_runtime");
+    const second = await req("/v1/chat/completions", {
+      ...body,
+      session_id: first.headers.get("x-session-id"),
+      stream: true,
+    });
+    const stream = await second.text();
+    expect(stream).toContain('"content":"SPARK_OK"');
+    expect(stream).toContain("data: [DONE]");
+    expect(stream).not.toContain("PRIVATE_SPARK");
+    expect(lastPayload[71]).toEqual([
+      "c_runtime",
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      "PRIVATE_SPARK_CURSOR",
+    ]);
+    expect(lastPayload[2]).toBeNull();
+    expect(lastPayload[83]).toBeNull();
+    const before = calls;
+    const wrong = await req("/v1/chat/completions", {
+      ...body,
+      model: "gemini-3.8-flash",
+      session_id: first.headers.get("x-session-id"),
+    });
+    expect(wrong.status).toBe(400);
+    expect(calls).toBe(before);
+  });
 });

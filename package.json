@@ -21,7 +21,8 @@
     "format:check": "prettier --check src tests public scripts docs README.md package.json tsconfig.json .github/workflows/ci.yml",
     "build": "wrangler deploy --dry-run --outdir dist",
     "setup:secrets": "node scripts/init-secrets.mjs",
-    "smoke:media": "node scripts/smoke-media.mjs"
+    "smoke:media": "node scripts/smoke-media.mjs",
+    "smoke:spark": "node scripts/smoke-spark.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261004.1",

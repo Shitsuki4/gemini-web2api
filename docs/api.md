@@ -33,6 +33,30 @@
 
 Chat SSE 为 `data: {...}`，正常完成发送 `data: [DONE]`。流建立后的错误用 `event: error` 表示，HTTP 200 不代表最终成功。Responses SSE 使用 `response.created`、增量/结束事件和 `response.completed`；失败发送 `response.failed`。工具输出及媒体输出可能缓冲后再发送，不承诺实时逐字。
 
+## Spark Beta（实验性文本适配）
+
+请求 `"model": "gemini-spark"`，使用同样的 Chat/Responses 接口和 `X-Session-Id` 续聊。它是网页 Spark 任务模式（tool 40），不是给普通 Flash 换名；需要账号本身能使用 Spark。模型清单不代表账号权益或上游健康。
+
+```json
+{
+  "model": "gemini-spark",
+  "messages": [
+    {
+      "role": "user",
+      "content": "只用文字解释闭包，不调用工具或访问关联应用。"
+    }
+  ],
+  "stream": true
+}
+```
+
+- 独立 99 槽请求、Spark 模型头、`/spark` 页面令牌及加密任务续接游标；不能和普通模型切换同一会话。
+- 当前范围是文本对话；附件、函数工具、JSON object 结构化输出直接返回 `400 spark_text_only`。显式 `response_format: {"type":"text"}` 可用。
+- 只导出答案帧，不导出计划、私有推理、工具参数或关联应用的中间数据。游标只保存在加密会话内，不返回客户端。
+- Spark 可能先处理任务、最后一次性给出答案。SSE 按收到的真实答案帧发送；不人为切字，不承诺逐 token、多增量或立即出首字。没有终止事件则返回 `spark_incomplete`，没有答案则返回真实上游错误或 `no_content`，不能把 HTTP 200 的事件流当作成功。
+- 网关加入“仅文本、不调用工具/关联应用/计划任务”的范围提示；**提示词不是强制沙箱**，并无已验证的服务端禁用关联应用开关。不要用此入口执行外部操作或发送敏感应用数据；需要更强隔离时，使用未关联外部应用的专用账号。未提供任务管理、审批、计划、技能、关联应用或后台代理 API。
+- 请求超时/断流不等于上游任务已取消。网关不自动重放任务，也不提供幂等提交承诺。实际测试结果及失败边界见[验收报告](verification.md)。
+
 ## Responses
 
 ```json

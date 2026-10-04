@@ -1,4 +1,4 @@
-import type { Model } from "../types";
+import type { Model, SparkContext } from "../types";
 import { ApiError } from "../util";
 const bases = [
   ["gemini-3.6-flash", "fbb127bbb056c959", 1],
@@ -17,6 +17,14 @@ for (const [id, tool] of [
   ["gemini-video", 11],
 ] as const)
   MODELS.push({ id, tool, hex: bases[0][1], mode: 1 });
+// Spark Beta is an agent/task protocol, not a Flash alias.
+MODELS.push({
+  id: "gemini-spark",
+  hex: "56fdd199312815e2",
+  mode: 1,
+  tool: 40,
+  spark: true,
+});
 export function resolveModel(id: string) {
   const model = MODELS.find((m) => m.id === id);
   if (!model)
@@ -28,7 +36,7 @@ export function resolveModel(id: string) {
   return model;
 }
 export function modelHeader(model: Model, uuid: string) {
-  return JSON.stringify([
+  const h: unknown[] = [
     1,
     null,
     null,
@@ -37,16 +45,25 @@ export function modelHeader(model: Model, uuid: string) {
     null,
     null,
     0,
-    [4, 5, 6, 8],
+    model.spark ? [4, 5, 6, 8, 16, 4, 5, 6, 8, 16] : [4, 5, 6, 8],
     null,
     null,
-    1,
+    model.spark ? 2 : 1,
     null,
     null,
     model.mode,
     model.thinking ? 2 : 1,
     uuid,
-  ]);
+  ];
+  if (model.spark) {
+    // Preserve the observed Spark capability sequence and timestamp structure.
+    // The abbreviated normal header accepted a task but produced no answer.
+    const timestamp = Date.now();
+    h[17] = null;
+    h[18] = null;
+    h[19] = [[], [Math.floor(timestamp / 1000), (timestamp % 1000) * 1000000]];
+  }
+  return JSON.stringify(h);
 }
 export function payload(
   prompt: string,
@@ -55,8 +72,9 @@ export function payload(
   metadata?: unknown[],
   turn = 0,
   refs: unknown[] = [],
+  sparkContext?: SparkContext,
 ): unknown[] {
-  const a = Array(97).fill(null);
+  const a = Array(model.spark ? 99 : 97).fill(null);
   a[0] = [prompt, 0, null, refs.length ? refs : null, null, null, 0];
   a[1] = ["en"];
   a[2] = metadata || ["", "", "", null, null, null, null, null, null, ""];
@@ -79,5 +97,27 @@ export function payload(
   a[96] = model.thinking ? 1 : 0;
   if (model.tool) a[49] = model.tool;
   if (model.tool === 11) a[55] = [[16]];
+  if (model.spark) {
+    // Observed on the signed-in Spark UI. Never copy browser challenge slots 3/4.
+    a[2] = null;
+    a[6] = [1];
+    a[30] = [4, 16];
+    a[67] = 0;
+    a[68] = 2;
+    a[83] = sparkContext ? null : 1;
+    a[98] = 1;
+    if (sparkContext) {
+      a[71] = [
+        sparkContext.conversationId,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        sparkContext.cursor ?? null,
+      ];
+    }
+  }
   return a;
 }

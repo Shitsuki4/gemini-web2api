@@ -170,3 +170,45 @@ function responseData(c: string) {
     return false;
   }
 }
+
+// Spark sends progress/control objects at slot 2 between answer frames. Do not
+// recursively walk these: they may contain planning, tool inputs or app data.
+export function absorbSpark(result: Result, inner: any): boolean {
+  if (!Array.isArray(inner)) return false;
+  const cid = inner[1]?.[0];
+  if (typeof cid === "string" && /^c_[a-zA-Z0-9_-]+$/.test(cid)) {
+    const previous = result.metadata;
+    result.metadata = [...inner[1]];
+    if (previous[0] === cid && previous[1] === inner[1][1] && previous[2])
+      result.metadata[2] = previous[2];
+    result.sparkContext = {
+      conversationId: cid,
+      ...(result.sparkContext?.conversationId === cid
+        ? { cursor: result.sparkContext.cursor }
+        : {}),
+    };
+  }
+  const cursor = inner[2]?.[26];
+  if (
+    result.sparkContext &&
+    typeof cursor === "string" &&
+    cursor.length <= 4096
+  )
+    result.sparkContext.cursor = cursor;
+  const candidate = inner[4]?.[0];
+  if (
+    Array.isArray(candidate) &&
+    typeof candidate[0] === "string" &&
+    candidate[0].startsWith("rc_")
+  ) {
+    result.metadata[2] = candidate[0];
+    if (typeof candidate[1]?.[0] === "string" && candidate[1][0])
+      result.text = candidate[1][0];
+  }
+  // Explicit terminal task event, distinct from a planning/completion-looking text.
+  return (
+    !!result.sparkContext &&
+    inner[2]?.[44] === true &&
+    inner[2]?.[46]?.[0] === result.sparkContext.conversationId
+  );
+}
