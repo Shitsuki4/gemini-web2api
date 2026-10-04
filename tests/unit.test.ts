@@ -215,6 +215,45 @@ describe("credentials and transport safety", () => {
     ).rejects.toThrow("allowed");
     expect(count).toBe(1);
   });
+  it("preserves download auth tickets on each approved redirect without host-only cookies", async () => {
+    const hosts: string[] = [];
+    const client = new GeminiClient(
+      {
+        cookie:
+          "SID=sid; __Secure-1PSID=psid; __Secure-1PSIDTS=ticket; __Secure-3PSIDTS=third; SIDCC=cc; __Host-1PLSID=private; LSID=local; OTHER=secret",
+      },
+      async () => {},
+      new AbortController().signal,
+      async (url, init) => {
+        hosts.push(new URL(String(url)).hostname);
+        const cookie = new Headers(init?.headers).get("cookie")!;
+        expect(cookie).toContain("__Secure-1PSIDTS=ticket");
+        expect(cookie).toContain("__Secure-3PSIDTS=third");
+        expect(cookie).toContain("SIDCC=cc");
+        expect(cookie).not.toMatch(/__Host-|LSID|OTHER/);
+        if (hosts.length === 1)
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location:
+                "https://work.fife.usercontent.google.com/rd-gg-dl/test",
+            },
+          });
+        return new Response(new Uint8Array([1, 2, 3]), {
+          headers: { "content-type": "image/png" },
+        });
+      },
+    );
+    const response = await client.download(
+      "https://lh3.googleusercontent.com/gg-dl/test",
+    );
+    expect(response.status).toBe(200);
+    expect((await response.arrayBuffer()).byteLength).toBe(3);
+    expect(hosts).toEqual([
+      "lh3.googleusercontent.com",
+      "work.fife.usercontent.google.com",
+    ]);
+  });
   it("does not accept login HTML as image bytes", async () => {
     const client = new GeminiClient(
       { cookie: "SID=x" },

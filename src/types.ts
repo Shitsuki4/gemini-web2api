@@ -11,6 +11,7 @@ export interface Env {
   REQUEST_TIMEOUT_MS?: string;
   SESSION_TTL_SECONDS?: string;
   ACCOUNT_LOCATION_HINT?: string;
+  UPSTREAM_TRANSPORT?: string;
 }
 export interface AccountRow {
   id: string;

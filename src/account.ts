@@ -19,6 +19,7 @@ import {
   unseal,
 } from "./util";
 import { GeminiClient, validateCookie } from "./gemini/client";
+import { socketTransport } from "./gemini/socket";
 import { delta } from "./gemini/protocol";
 import { chatResponse, finishResult, responsesResponse } from "./api";
 import { eventStream, type EventSink } from "./sse";
@@ -77,7 +78,19 @@ export class GeminiAccount implements DurableObject {
         "account_unconfigured",
         "Account has no imported cookie",
       );
-    return new GeminiClient(this.creds, () => this.save(), signal);
+    const transport = this.env.UPSTREAM_TRANSPORT || "socket";
+    if (!["socket", "fetch"].includes(transport))
+      throw new ApiError(
+        503,
+        "invalid_transport",
+        "UPSTREAM_TRANSPORT must be socket or fetch",
+      );
+    return new GeminiClient(
+      this.creds,
+      () => this.save(),
+      signal,
+      transport === "fetch" ? fetch.bind(globalThis) : socketTransport(),
+    );
   }
   private timeout(signal?: AbortSignal) {
     const timeout = AbortSignal.timeout(

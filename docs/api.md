@@ -79,6 +79,8 @@ JSON 模式仅 `response_format:{"type":"json_object"}`；Responses 可用 `text
 
 ## 媒体实验接口
 
+本次已实际验收图片生成及 JPEG 下载；音乐、Canvas、视频尚未实测成功。txt 附件已验收，其它附件格式不能仅凭相同接口推定可用。
+
 - 图片：`{"prompt":"画一只猫","model":"gemini-image","response_format":"url"}`。返回下载 URL **仍需原 API Key**，不是公开永久链接，不支持 b64_json。
 - 音乐/Canvas：通过 Chat 指定 `gemini-music` / `gemini-canvas`。Canvas 只作为文本返回，管理台不执行 HTML。
 - 视频：`POST /v1/videos`，`{"prompt":"一段海浪视频","model":"gemini-video"}`，随后查询返回的完整 ID。状态 queued / in_progress / completed / failed。默认 10 分钟任务超时，24 小时作业 TTL；内容地址通常 1 小时过期。

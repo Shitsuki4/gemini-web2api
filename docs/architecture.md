@@ -5,7 +5,7 @@
 1. Worker 在解析大请求前校验 Bearer Key。管理员/API 密钥分离，未配置管理员密钥时 API 失败关闭。
 2. D1 保存账号索引，按最久未使用顺序选择启用且不在冷却期的账号。显式会话固定路由到原账号。
 3. 每个账号一个 SQLite Durable Object。DO 持有加密 Cookie、会话元数据、媒体地址和视频任务；同账号生成串行化，忙时返回 429。
-4. `GeminiClient` 直接使用 Workers `fetch` 请求 Google。**没有 Go TLS 指纹模拟、外部代理或浏览器伪装传输**。导入的 User-Agent 仅是普通 HTTP 头，不能改变出口 IP/TLS 指纹。
+4. `GeminiClient` 默认通过 Cloudflare `cloudflare:sockets` 直接连接 Google 443 端口，使用平台验证证书的 TLS + HTTP/1.1。**没有 Go TLS 指纹模拟、外部代理或浏览器伪装传输**。导入的 User-Agent 仅是普通 HTTP 头，不能改变出口 IP/TLS 指纹。
 5. 网页响应按 XSSI/行包络解码，跨网络块维护 UTF-8 状态，再转成 OpenAI JSON/SSE。累计文本回退/改写会显式报错，不重复输出。
 6. D1 将完成的生成尝试元数据和当日统计放入同一事务批次。DO Alarms 负责 Cookie 轮换、视频轮询和过期清理，默认不占 Cron 名额。
 
@@ -15,11 +15,18 @@
 | --------------------------- | ------------------------------------------------ |
 | `src/index.ts`              | 路由、鉴权、账号池、管理 API、适配入口           |
 | `src/account.ts`            | DO 状态、并发、限流、加密存储、会话、作业、Alarm |
+| `src/gemini/socket.ts`      | HTTPS 白名单、超时/取消、HTTP framing 校验和背压 |
 | `src/gemini/client.ts`      | 页面令牌、生成、RPC、上传、轮换、限定主机下载    |
 | `src/gemini/models.ts`      | 显式模型 ID、请求头、97 槽位请求体               |
 | `src/gemini/protocol.ts`    | 包络、文本增量、实际模型、媒体地址识别           |
 | `src/api.ts` / `src/sse.ts` | OpenAI 格式、输入验证、背压和心跳                |
 | `public/`                   | 无构建依赖的管理台；上游返回文本不作为 HTML 执行 |
+
+## 传输边界
+
+`UPSTREAM_TRANSPORT=socket` 为默认路径；`fetch` 仅作显式诊断替代，**不会自动切换出口或重放失败生成**。GeminiClient 仅在 HTTP 400 时刷新页面令牌后重试一次；没有对 429、验证页或不确定提交做自动重放。每次 HTTPS 请求一个 socket，响应结束/取消/异常时关闭。禁止 HTTP、用户信息、非标准端口及任意目标主机；自管 Host、Content-Length、Connection 和压缩协商。分块、长度、头/响应大小均校验，截断不会当作正常结束。
+
+保留 DO 而不保留旧版 `EgressRelay.fetch`：旧路径在 DO 内仍用 `fetch`，并不等同于 socket。详见[参考对照](references.md)。Cloudflare 放置 hint 只影响对象初始放置建议，不保证地点，也不会迁移已经存在的 DO。
 
 ## 持久化内容
 

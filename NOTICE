@@ -16,3 +16,18 @@ Repository history before this rewrite is retained on the original main
 branch and in git history. Historical upstream attribution remains there.
 Cloudflare and Google/Gemini are trademarks of their respective owners.
 This project is unofficial and is not endorsed by either company.
+
+Additional architectural/protocol comparison (no source copied into the
+production socket transport):
+  Sophomoresty/gemini-web2api
+  https://github.com/Sophomoresty/gemini-web2api
+  Reference commit: 2bb988bfcbb82a7fab5d2c99aa5560ff40d64f7e
+  one880808/gemini-web2api
+  https://github.com/one880808/gemini-web2api
+  Reference commit: a7cd9f6ba64631d4cdeeb4663ca0902b9f5d516a
+  Original Shitsuki4/gemini-web2api main: cf94c7d
+
+The socket transport and its framing/abort/timeout tests were independently
+implemented. These additional sources informed the choice of Cloudflare
+native TCP/TLS over platform fetch. See docs/references.md for differences
+and measured results. Attribution does not imply endorsement or parity.

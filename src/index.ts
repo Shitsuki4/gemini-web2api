@@ -225,6 +225,7 @@ async function adminRoute(request: Request, env: Env, path: string) {
       version: "3.0.0",
       runtime: "Cloudflare Workers + SQLite Durable Objects + D1",
       external_proxy: false,
+      upstream_transport: env.UPSTREAM_TRANSPORT || "socket",
       browser_required_at_runtime: false,
       r2_required: false,
       default_model: env.DEFAULT_MODEL || "gemini-3.6-flash",

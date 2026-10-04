@@ -51,6 +51,7 @@ beforeAll(async () => {
     format: "esm",
     platform: "browser",
     target: "es2022",
+    external: ["cloudflare:sockets"],
   });
   mf = new Miniflare({
     modules: true,
@@ -61,6 +62,7 @@ beforeAll(async () => {
     },
     d1Databases: { DB: "db" },
     bindings: {
+      UPSTREAM_TRANSPORT: "fetch",
       ADMIN_KEY: admin,
       API_KEY: apiKey,
       ENCRYPTION_KEY: btoa("k".repeat(32)),

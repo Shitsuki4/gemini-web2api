@@ -469,6 +469,15 @@ export class GeminiClient {
       "__Secure-3PSID",
       "__Secure-1PAPISID",
       "__Secure-3PAPISID",
+      "__Secure-1PSIDTS",
+      "__Secure-3PSIDTS",
+      "__Secure-1PSIDRTS",
+      "__Secure-3PSIDRTS",
+      "SIDCC",
+      "__Secure-1PSIDCC",
+      "__Secure-3PSIDCC",
+      "NID",
+      "GOOGLE_ABUSE_EXEMPTION",
     ];
     const cookies = names
       .filter((k) => jar.has(k))

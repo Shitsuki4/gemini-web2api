@@ -1,19 +1,19 @@
 # gemini-web2api · Cloudflare 原生重构
 
-使用 **Workers + SQLite Durable Objects + D1 + 静态资源**，将 Gemini 网页协议适配为 HTTP API。参考 [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)，不是把 Go 服务器搬进容器，也不依赖外部代理、VPS、R2 或常驻本地浏览器。
+使用 **Workers + SQLite Durable Objects + D1 + 静态资源**，将 Gemini 网页协议适配为 HTTP API。参考 [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)，并对照 Sophomoresty、one880808 及本仓库原版传输实现，不是把 Go 服务器搬进容器，也不依赖外部代理、VPS、R2 或常驻本地浏览器。
 
-> **当前状态：实验性，尚未通过真实生成验收。** 2026-10-05 的独立 Cloudflare 测试部署可以鉴权、导入 Roxy 登录态、管理账号和列出模型；真实文本请求被 Google 重定向至 `/sorry`，返回 `502 / egress_blocked`。没有真实文本、图片、音乐或视频成功证据。单元测试和模拟上游集成测试不能证明 Google 接受 Cloudflare 出口。不要据此替换正在使用的服务。详见[验收报告](docs/verification.md)。
+> **当前状态：纯 Cloudflare 文本链路已通过真实验收。** 2026-10-05 在 Workers Free + SQLite DO + D1 上，原生 TLS socket 传输已完成非流式回答、只传会话 ID 的第二轮续聊、11 个文本增量的 SSE、Responses JSON、txt 附件读取及图片生成/下载。不是模拟上游，也没有经过 Roxy 中转。之前 fetch 路径遭遇 Google 验证的结论已被这个实测修正。**音乐/视频等其它媒体及长期 Cookie 续期仍须分别验收，不承诺 Go 项目全部功能等价或长期稳定。** 详见[验收报告](docs/verification.md)与[参考项目对照](docs/references.md)。
 
 ## 能做什么
 
 | 功能             | 本实现                                                       | 验证边界                                                                  |
 | ---------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------- |
-| OpenAI Chat、SSE | `/v1/chat/completions`，累计文本转增量、背压、心跳、取消     | 模拟上游通过，真实上游阻断                                                |
+| OpenAI Chat、SSE | `/v1/chat/completions`，累计文本转增量、背压、心跳、取消     | 真实文本 / 多增量 SSE 已通过                                              |
 | Responses        | `/v1/responses`，基本文本/函数调用事件，失败生命周期         | 非完整 OpenAI 替代；不支持 `previous_response_id`                         |
 | 会话续接         | API Key 隔离、账号固定、加密元数据、默认 7 天 TTL            | 必须传 `session_id`，每轮仅新增一条 user/tool 消息                        |
 | 账号池           | 每账号一个 DO，串行生成、6 次尝试/分钟、冷却、最久未使用优先 | 不提供 IP 池或地区解锁保证                                                |
 | 文件输入         | base64 data URL，最多 4 个附件                               | 单文件 768 KiB，整个请求 1 MiB；拒绝远程文件 URL                          |
-| 图片/音乐/Canvas | 网页工具开关和鉴权下载代理                                   | 实验性，受 Google 账号权益影响，未实测成功                                |
+| 图片/音乐/Canvas | 网页工具开关和鉴权下载代理                                   | 图片已实测生成/下载；音乐、Canvas 未真实验收                              |
 | 视频             | 提交作业、DO Alarm 轮询、状态/鉴权下载                       | 实验性，10 分钟超时，不自动重放不确定的提交                               |
 | 函数工具 / JSON  | 提示词模拟工具调用；JSON object 输出解析检查                 | 非原生函数协议，不执行工具，不保证遵守提示词，拒绝 strict schema          |
 | Google API       | 基础非流式 `generateContent`                                 | 只做文本/inlineData 适配，不支持完整 generationConfig、安全设置或原生流式 |
@@ -30,6 +30,8 @@ npm ci
 npx wrangler login
 npx wrangler d1 create gemini-web2api-v3
 ```
+
+默认 `UPSTREAM_TRANSPORT="socket"`；不要误改为 `fetch`，两者的 Cloudflare 出口行为不同。`ACCOUNT_LOCATION_HINT="wnam"` 是初始放置建议，不保证 IP/国家；修改后不会迁移已有 DO。
 
 将命令返回的数据库 ID 写入 `wrangler.toml` 的 `database_id`。保留独立 Worker 名称 `gemini-web2api-native`，不要直接覆盖旧服务名称。
 
@@ -84,6 +86,8 @@ Invoke-RestMethod "$env:GATEWAY_URL/v1/chat/completions" -Method Post `
 
 模型列表是协议适配器清单，**不是账号权益探测或成功承诺**。响应扩展字段 `gemini.actual_model` 取自上游实际模型描述，缺失则为 null。详细端点、会话和限制见 [API 使用](docs/api.md)。
 
+`npm run smoke:media` 可另测 txt 附件和图片生成/下载（2 次生成，会消耗图片权益）；返回的是需原 API Key 的网关下载地址，不是公开图片链接。
+
 ## 免费额度不是无限额度
 
 按 2026-10-05 查询的 Cloudflare 文档：
@@ -108,12 +112,13 @@ npm run format:check
 npm run build
 ```
 
-`npm run build` 只打包 dry-run，不发布。CI 不需要真实 Google Cookie 或 Cloudflare 密钥。集成测试在 workerd 中运行 SQLite DO 和 D1，Google 传输为模拟响应。`tests/harness.ts` 只用于测试，不进入部署包。
+`npm run build` 只打包 dry-run，不发布。CI 不需要真实 Google Cookie 或 Cloudflare 密钥。集成测试在 workerd 中运行 SQLite DO 和 D1，Google 传输为模拟响应；socket 单元测试注入模拟连接，真实连接由独立线上验收覆盖。`npm run smoke` 会消耗 4 次真实生成：非流式、续聊、SSE 和 Responses，任一失败均非零退出。`tests/harness.ts` 只用于测试，不进入部署包。
 
 - [架构与数据保留](docs/architecture.md)
 - [API 使用与兼容范围](docs/api.md)
 - [部署、密钥、故障排查、迁移与回滚](docs/operations.md)
 - [当前验收结果](docs/verification.md)
+- [参考仓库及旧版差异](docs/references.md)
 
 ## 协议来源与许可
 

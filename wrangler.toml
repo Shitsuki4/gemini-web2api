@@ -28,6 +28,7 @@ deleted_classes = ["EgressRelay"]
 new_sqlite_classes = ["GeminiAccount"]
 
 [vars]
+UPSTREAM_TRANSPORT = "socket"
 DEFAULT_MODEL = "gemini-3.6-flash"
 MAX_ACCOUNTS = "5"
 MAX_REQUEST_BYTES = "1048576"
