@@ -429,6 +429,23 @@ describe("OpenAI normalization and function emulation", () => {
       ),
     ).toThrow("JSON object");
   });
+  it("communicates tool_choice none to Gemini with or without definitions", () => {
+    for (const tools of [undefined, [], [tool]]) {
+      const input = normalize(
+        { ...base, tools, tool_choice: "none" },
+        "chat",
+        key,
+        base.model,
+      );
+      expect(input.prompt).toContain(
+        "Tool choice: none. Do not request or execute any function.",
+      );
+      expect(input.prompt).toContain(
+        "results of previous calls, not requests to repeat those calls",
+      );
+      expect(input.prompt).not.toContain("If a function is needed");
+    }
+  });
   it("tool_choice none prevents function interpretation", () => {
     const r = {
       ...emptyResult(),

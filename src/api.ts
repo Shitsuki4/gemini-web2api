@@ -217,6 +217,14 @@ export function normalize(
         (choice || "auto");
     }
   }
+  // This protocol has no native tool-choice option. In particular, merely
+  // suppressing parsed calls does not tell Gemini how to consume a tool result.
+  if (body.tool_choice === "none")
+    prompt +=
+      "\n\n[Function interface, prompt-emulated; tools disabled for this turn]\n" +
+      "Tool choice: none. Do not request or execute any function. " +
+      "Tool messages already supplied are results of previous calls, not requests to repeat those calls. " +
+      "Use the supplied results to answer the user and follow the system/developer instructions.";
   if (body.response_format && body.response_format.type !== "text") {
     if (body.response_format.type !== "json_object")
       return bad(

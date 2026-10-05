@@ -868,6 +868,7 @@ describe("OpenAI client session compatibility in workerd", () => {
       const result = await chat({
         session_id: opaque,
         tools,
+        tool_choice: "none",
         messages: [
           ...history,
           { role: "assistant", content: null, tool_calls: [call] },
@@ -877,6 +878,9 @@ describe("OpenAI client session compatibility in workerd", () => {
       expect(result.status).toBe(200);
       await result.text();
       expect(lastPrompt).toContain("LOCAL_TOOL_RESULT");
+      expect(lastPrompt).toContain(
+        "Tool choice: none. Do not request or execute any function.",
+      );
       expect(lastPrompt).toContain("EARLIER_QUESTION");
     },
   );
