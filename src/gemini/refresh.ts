@@ -40,10 +40,11 @@ export function refreshDelay(
   retryAfter: number,
   interval: number,
 ) {
-  if (!failures) return Math.max(60, interval);
+  // SIDCC's suggested cadence must never extend the short-ticket cadence.
+  const normal = Math.max(60, Math.min(REFRESH_INTERVAL, interval));
+  if (!failures) return normal;
   return Math.max(
-    60,
-    interval,
+    normal,
     retryAfter,
     Math.min(
       21600,
@@ -54,7 +55,7 @@ export function refreshDelay(
 export function maintenanceMessage(s: LoginMaintenance) {
   const status =
     s.status === "healthy"
-      ? "短期票据已换发，SIDCC 和页面登录检查均通过。"
+      ? "短期票据已换发，页面登录有效，SIDCC 已更新或尚未到维护时间。"
       : s.status === "reimport_required"
         ? "自动续期未恢复登录。请在浏览器确认登录后更新原账号；不会重放生成。"
         : "本轮保活未全部通过；页面可用不等于长期票据已续期。";
@@ -130,7 +131,7 @@ export async function refreshLogin(
   // Persist before I/O so eviction / a deployment cannot erase the retry floor.
   await c.save();
   let retryAfter = 0,
-    interval = REFRESH_INTERVAL,
+    interval = old?.intervalSeconds || REFRESH_INTERVAL,
     rateLimited = false;
   const accept = async (r: Response) => {
     if (r.status === 429) rateLimited = true;
@@ -229,42 +230,44 @@ export async function refreshLogin(
     ? { status: "ok", at: now(), cookies: issuedSidcc }
     : rateLimited
       ? { status: "skipped", at: now(), code: "refresh_rate_limited" }
-      : await step(async () => {
-          const r = await c.send(ROTATE_PAGE, {
-            headers: {
-              Cookie: subset(c.credentials.cookie, sharedNames),
-              Accept: "text/html",
-              Referer: "https://gemini.google.com/",
-              "Sec-Fetch-Dest": "iframe",
-              "Sec-Fetch-Mode": "navigate",
-              "Sec-Fetch-Site": "same-site",
-            },
-          });
-          const names = await accept(r);
-          const params = rotateParams(
-            new TextDecoder().decode(await readLimited(r, 1024 * 1024)),
-          );
-          interval = params.interval;
-          const done = await c.send(ROTATE_POST, {
-            method: "POST",
-            headers: {
-              ...base,
-              Referer: ROTATE_PAGE,
-              Cookie: subset(c.credentials.cookie, sharedNames),
-            },
-            body: JSON.stringify([658, params.id]),
-          });
-          names.push(...(await accept(done)));
-          await done.body?.cancel();
-          if (!names.some((n) => /^(?:__Secure-[13]PSIDCC|SIDCC)$/.test(n)))
-            throw new ApiError(
-              502,
-              "refresh_no_sidcc",
-              "Rotation did not issue SIDCC cookies",
+      : old?.lastSidccAt && now() < old.lastSidccAt + interval
+        ? { status: "skipped", at: now(), code: "refresh_not_due" }
+        : await step(async () => {
+            const r = await c.send(ROTATE_PAGE, {
+              headers: {
+                Cookie: subset(c.credentials.cookie, sharedNames),
+                Accept: "text/html",
+                Referer: "https://gemini.google.com/",
+                "Sec-Fetch-Dest": "iframe",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-site",
+              },
+            });
+            const names = await accept(r);
+            const params = rotateParams(
+              new TextDecoder().decode(await readLimited(r, 1024 * 1024)),
             );
-          state.lastSidccAt = now();
-          return names;
-        });
+            interval = params.interval;
+            const done = await c.send(ROTATE_POST, {
+              method: "POST",
+              headers: {
+                ...base,
+                Referer: ROTATE_PAGE,
+                Cookie: subset(c.credentials.cookie, sharedNames),
+              },
+              body: JSON.stringify([658, params.id]),
+            });
+            names.push(...(await accept(done)));
+            await done.body?.cancel();
+            if (!names.some((n) => /^(?:__Secure-[13]PSIDCC|SIDCC)$/.test(n)))
+              throw new ApiError(
+                502,
+                "refresh_no_sidcc",
+                "Rotation did not issue SIDCC cookies",
+              );
+            state.lastSidccAt = now();
+            return names;
+          });
   if (state.sidcc.status === "ok") state.lastSidccAt = now();
   await c.save();
   // Crucially, a 401/429 in RotateCookies does not suppress this independent GET.
@@ -276,7 +279,7 @@ export async function refreshLogin(
   });
   const good =
     state.ticket.status === "ok" &&
-    state.sidcc.status === "ok" &&
+    (state.sidcc.status === "ok" || state.sidcc.code === "refresh_not_due") &&
     state.page.status === "ok";
   const authFailure =
     state.page.code === "login_expired" &&

@@ -7,7 +7,7 @@ import {
   TICKET_BODY,
   ROTATE_PAGE,
 } from "../src/gemini/refresh";
-import { ApiError, now } from "../src/util";
+import { ApiError } from "../src/util";
 import type { Credentials } from "../src/types";
 const time = 1791160000;
 function setup(
@@ -20,6 +20,7 @@ function setup(
     cookies?: string[];
     retry?: string;
     firstPageFails?: boolean;
+    interval?: number;
   } = {},
 ) {
   vi.spyOn(Date, "now").mockReturnValue(time * 1000);
@@ -61,7 +62,7 @@ function setup(
     }
     if (url === ROTATE_PAGE)
       return new Response(
-        "init('4162200486104360679', 658.0, 0.0, 0.0, 600.0)",
+        `init('4162200486104360679', 658.0, 0.0, 0.0, ${options.interval || 600}.0)`,
       );
     if (url.endsWith("/app")) {
       pages++;
@@ -285,6 +286,23 @@ describe("durable login maintenance", () => {
     expect(
       x.requests.filter((r) => r.url.includes("StreamGenerate")),
     ).toHaveLength(1);
+  });
+  it("maintains short tickets at ten minutes even if SIDCC asks for one hour", async () => {
+    const x = setup({ interval: 3600 });
+    const first = await x.client.rotate();
+    expect(first.intervalSeconds).toBe(3600);
+    expect(first.nextAttemptAt).toBe(time + 600);
+    vi.spyOn(Date, "now").mockReturnValue((time + 600) * 1000);
+    const next = await x.client.rotate();
+    expect(next.status).toBe("healthy");
+    expect(next.sidcc?.code).toBe("refresh_not_due");
+    expect(next.lastSidccAt).toBe(time);
+    expect(next.lastTicketAt).toBe(time + 600);
+    expect(next.nextAttemptAt).toBe(time + 1200);
+    expect(x.requests.filter((r) => r.url === ROTATE_PAGE)).toHaveLength(1);
+    vi.spyOn(Date, "now").mockReturnValue((time + 3600) * 1000);
+    expect((await x.client.rotate()).sidcc?.status).toBe("ok");
+    expect(x.requests.filter((r) => r.url === ROTATE_PAGE)).toHaveLength(2);
   });
   it("does not make network requests if initial persistence fails", async () => {
     const x = setup();

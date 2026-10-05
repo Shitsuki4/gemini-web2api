@@ -169,4 +169,4 @@ JSON 模式仅 `response_format:{"type":"json_object"}`；Responses 可用 `text
 }
 ```
 
-HTTP 200 只表示诊断完成；必须检查 `ok` / `renewed` 和各步骤。`ok:true` 表示三项成功；`renewed:true` 只表示本轮确实换发了短期票据。退避期内不发上游请求，返回 `429 refresh_backoff` 与 `Retry-After`；账号停用时返回 `503 account_disabled`。
+HTTP 200 只表示诊断完成；必须检查 `ok` / `renewed` 和各步骤。`ok:true` 表示票据与页面成功，SIDCC 已更新或仍在建议有效维护间隔内；`renewed:true` 只表示本轮确实换发了短期票据。退避期内不发上游请求，返回 `429 refresh_backoff` 与 `Retry-After`；账号停用时返回 `503 account_disabled`。
