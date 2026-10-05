@@ -46,7 +46,7 @@ async function generate(mode) {
         {
           role: "user",
           content: tools
-            ? 'Call get_weather exactly once with {"city":"Shanghai"}. Do not execute it.'
+            ? 'Call get_weather exactly once with {"city":"Shanghai"}. Do not guess weather or call any other tools.'
             : `Reply with exactly ${marker}`,
         },
       ],
@@ -57,6 +57,7 @@ async function generate(mode) {
                 type: "function",
                 function: {
                   name: "get_weather",
+                  description: "Return current weather for the given city.",
                   parameters: {
                     type: "object",
                     properties: { city: { type: "string" } },
@@ -141,6 +142,14 @@ try {
     observationError = e;
   }
   const results = await pending;
+  results.forEach((result, index) => {
+    if (result.status === "rejected")
+      report(["nonstream", "stream", "tools"][index], {
+        ok: false,
+        message: result.reason?.message,
+        cause: result.reason?.cause?.code,
+      });
+  });
   const failed = results.find((x) => x.status === "rejected");
   if (failed) throw failed.reason;
   if (observationError) throw observationError;
@@ -161,6 +170,10 @@ try {
     maintenance: final.maintenance?.status,
   });
 } catch (e) {
-  report("concurrency_failed", { ok: false, message: e.message });
+  report("concurrency_failed", {
+    ok: false,
+    message: e.message,
+    cause: e.cause?.code,
+  });
   process.exitCode = 1;
 }
