@@ -1,3 +1,4 @@
+import { apiCorsHeaders, apiPreflight, isPublicApi } from "./cors";
 import type { Env, AccountRow } from "./types";
 import {
   ApiError,
@@ -491,9 +492,12 @@ async function apiRoute(request: Request, env: Env, path: string) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     let response: Response;
+    const path = new URL(request.url).pathname;
+    const publicApi = isPublicApi(path);
     try {
-      const path = new URL(request.url).pathname;
-      if (path === "/healthz")
+      if (publicApi && request.method === "OPTIONS")
+        response = apiPreflight(request);
+      else if (path === "/healthz")
         response = json({
           status: "ok",
           version: "3.0.0",
@@ -501,13 +505,15 @@ export default {
         });
       else if (path.startsWith("/admin/"))
         response = await adminRoute(request, env, path);
-      else if (path.startsWith("/v1/") || path.startsWith("/v1beta/"))
-        response = await apiRoute(request, env, path);
+      else if (publicApi) response = await apiRoute(request, env, path);
       else response = await env.ASSETS.fetch(request);
     } catch (e) {
       response = errorResponse(e);
     }
     const headers = new Headers(response.headers);
+    if (publicApi)
+      for (const [name, value] of Object.entries(apiCorsHeaders()))
+        headers.set(name, value);
     headers.set("X-Content-Type-Options", "nosniff");
     headers.set("Referrer-Policy", "no-referrer");
     headers.set("X-Frame-Options", "DENY");

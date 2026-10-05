@@ -155,6 +155,70 @@ describe("actual workerd + SQLite DO + D1 integration", () => {
     const r = await mf.dispatchFetch("https://gateway.test/v1/models");
     expect(r.status).toBe(401);
   });
+  it("serves unauthenticated CORS preflight without touching Google or accounts", async () => {
+    const before = calls,
+      maintained = maintenanceCalls;
+    for (const path of [
+      "/v1/chat/completions",
+      "/v1beta/models/x:generateContent",
+      "/v1/files/test/content",
+    ]) {
+      const r = await mf.dispatchFetch("https://gateway.test" + path, {
+        method: "OPTIONS",
+        headers: {
+          Origin: "https://client.test",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers":
+            "authorization,content-type,x-stainless-lang",
+        },
+      });
+      expect(r.status).toBe(204);
+      expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(r.headers.get("Access-Control-Allow-Headers")).toContain(
+        "authorization",
+      );
+    }
+    expect(calls).toBe(before);
+    expect(maintenanceCalls).toBe(maintained);
+  });
+  it("exposes both success and authentication errors to cross-origin API clients", async () => {
+    for (const key of [apiKey, "invalid"]) {
+      const r = await mf.dispatchFetch("https://gateway.test/v1/models", {
+        headers: { ...headers(key), Origin: "https://client.test" },
+      });
+      expect(r.status).toBe(key === apiKey ? 200 : 401);
+      expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(r.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+      if (key !== apiKey)
+        expect(((await r.json()) as any).error.code).toBe("unauthorized");
+    }
+  });
+  it("keeps admin preflight private and rejects cross-origin authenticated admin writes", async () => {
+    for (const method of ["OPTIONS", "POST"]) {
+      const r = await mf.dispatchFetch("https://gateway.test/admin/keys", {
+        method,
+        headers: { ...headers(admin), Origin: "https://client.test" },
+        ...(method === "POST" ? { body: '{"name":"blocked"}' } : {}),
+      });
+      expect(r.status).toBe(403);
+      expect(r.headers.get("Access-Control-Allow-Origin")).toBeNull();
+      expect(((await r.json()) as any).error.code).toBe("origin_denied");
+    }
+    const health = await mf.dispatchFetch("https://gateway.test/healthz");
+    expect(health.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+  it("returns readable CORS errors for invalid preflight instead of bypassing authentication", async () => {
+    const r = await mf.dispatchFetch("https://gateway.test/v1/models", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://client.test",
+        "Access-Control-Request-Headers": "authorization: secret",
+      },
+    });
+    expect(r.status).toBe(400);
+    expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(((await r.json()) as any).error.code).toBe("invalid_cors_headers");
+  });
   it("keeps the Worker and static-asset CSP aligned for blob media previews", async () => {
     const r = await mf.dispatchFetch("https://gateway.test/v1/models");
     const staticHeaders = await readFile("public/_headers", "utf8");
@@ -246,6 +310,10 @@ describe("actual workerd + SQLite DO + D1 integration", () => {
     });
     const s = await r.text();
     expect(r.headers.get("content-type")).toContain("text/event-stream");
+    expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(r.headers.get("Access-Control-Expose-Headers")).toContain(
+      "X-Session-Id",
+    );
     expect(s).toContain('"content":"Hello"');
     expect(s).toContain('"content":" runtime"');
     expect(s).toContain("data: [DONE]");
@@ -277,6 +345,10 @@ describe("actual workerd + SQLite DO + D1 integration", () => {
       messages: [{ role: "user", content: "fail" }],
     });
     expect(r.status).toBe(429);
+    expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(r.headers.get("Access-Control-Expose-Headers")).toContain(
+      "Retry-After",
+    );
     expect(((await r.json()) as any).error.code).toBe("upstream_http_429");
     rejectUpstream = false;
   });

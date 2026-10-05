@@ -1,6 +1,14 @@
 # API 使用
 
-所有 `/v1/`、`/v1beta/` 请求均要求 `Authorization: Bearer <API_KEY>`；`/admin/` 使用独立 `ADMIN_KEY`。管理台只支持同源浏览器访问，未开放跨域 CORS。以下 JSON 中的文本和 ID 是示例，不是实际凭据。
+除浏览器 `OPTIONS` 预检外，所有 `/v1/`、`/v1beta/` 请求均要求 `Authorization: Bearer <API_KEY>`；`/admin/` 使用独立 `ADMIN_KEY`。管理接口 `/admin/` 仍只支持同源浏览器访问，不开放跨域 CORS。推理 API 支持跨域浏览器客户端（`Access-Control-Allow-Origin: *`），仍需 API Key，不允许携带 Cookie 凭据。以下 JSON 中的文本和 ID 是示例，不是实际凭据。
+
+## 浏览器客户端与 `Failed to fetch`
+
+- Base URL 使用 `https://<你的网关>/v1`；API Key 通过 `Authorization` 或 `X-API-Key` 请求头发送，不放入 URL。
+- 跨域调用使用 `credentials: "omit"`（或默认的 `same-origin`），不要设置 `include`。仅预检无需鉴权，真正的模型、生成和文件请求都需要有效 API Key。
+- `/v1/` 和 `/v1beta/` 支持 `GET, POST, OPTIONS` 预检及浏览器 SDK 自定义请求头；前提是字段名合法且总长度/数量受限。成功和错误响应均带 CORS；可读取 `X-Session-Id`、`Retry-After` 和下载元数据。不要把 ADMIN_KEY 填入第三方客户端，也不要把推理 API Key 交给不可信网页。
+- `Failed to fetch` 是浏览器无法获得可读响应，不足以证明 Gemini 登录失效；常见原因包括网络、错误地址、浏览器跨域策略或代理断流。用开发者工具检查 OPTIONS/POST 的状态，与管理台“请求记录”对照；记录缺失不单独证明请求从未到达服务器。
+- 自带管理台区分读取、写入、生成和下载的连接失败，不自动重发操作。生成 POST 失败可能已经消耗上游额度；先查记录再决定下一步。不要关闭浏览器安全检查或使用 `no-cors`（只会得到不可读响应）。
 
 ## 基础端点
 

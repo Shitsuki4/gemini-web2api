@@ -1,3 +1,4 @@
+import { browserError, fetchOnce, responseJson } from "./http.js";
 // Never navigate directly to an authenticated file URL or put a key in a URL.
 export function artifactPath(id) {
   if (
@@ -8,13 +9,17 @@ export function artifactPath(id) {
   return `/v1/files/${id}/content`;
 }
 export async function fetchArtifact(id, key, signal) {
-  const r = await fetch(artifactPath(id), {
-    headers: { Authorization: `Bearer ${key}` },
-    redirect: "error",
-    signal,
-  });
+  const r = await fetchOnce(
+    artifactPath(id),
+    {
+      headers: { Authorization: `Bearer ${key}` },
+      redirect: "error",
+      signal,
+    },
+    "download",
+  );
   if (!r.ok) {
-    const error = await r.json().catch(() => ({}));
+    const error = await responseJson(r, "download");
     throw Error(error.error?.message || `下载失败：HTTP ${r.status}`);
   }
   const mime = (r.headers.get("content-type") || "").split(";")[0].trim();
@@ -94,7 +99,7 @@ export function artifactGallery(container) {
         if (image) await preview.decode();
       } catch (error) {
         if (current !== generation) return;
-        status.textContent = `生成已完成，但预览/下载失败：${error.message}`;
+        status.textContent = `生成已完成，但预览/下载失败：${browserError(error, "download")}`;
       }
     }
   };

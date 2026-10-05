@@ -1,3 +1,4 @@
+import { browserError, fetchOnce, responseJson } from "./http.js";
 import { artifactGallery } from "./media.js";
 import { loginStatus } from "./login-status.js";
 const gallery = artifactGallery(document.getElementById("artifacts"));
@@ -20,15 +21,20 @@ function notify(message, error = false) {
   $("notice").className = error ? "error" : "";
 }
 async function api(path, method = "GET", data) {
-  const r = await fetch("/admin/" + path, {
-    method,
-    headers: {
-      Authorization: "Bearer " + adminKey,
-      "Content-Type": "application/json",
+  const context = method === "GET" ? "read" : "write";
+  const r = await fetchOnce(
+    "/admin/" + path,
+    {
+      method,
+      headers: {
+        Authorization: "Bearer " + adminKey,
+        "Content-Type": "application/json",
+      },
+      ...(data === undefined ? {} : { body: JSON.stringify(data) }),
     },
-    ...(data === undefined ? {} : { body: JSON.stringify(data) }),
-  });
-  const b = await r.json();
+    context,
+  );
+  const b = await responseJson(r, context);
   if (!r.ok) throw Error(b.error?.message || `HTTP ${r.status}`);
   return b;
 }
@@ -254,22 +260,26 @@ $("chat-form").onsubmit = async (e) => {
   gallery.clear();
   const inferenceKey = $("chat-key").value;
   try {
-    const r = await fetch("/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + inferenceKey,
-        "Content-Type": "application/json",
+    const r = await fetchOnce(
+      "/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + inferenceKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: $("model").value,
+          messages: [{ role: "user", content: $("prompt").value }],
+          stream: true,
+          ...(session ? { session_id: session } : {}),
+        }),
+        signal: controller.signal,
       },
-      body: JSON.stringify({
-        model: $("model").value,
-        messages: [{ role: "user", content: $("prompt").value }],
-        stream: true,
-        ...(session ? { session_id: session } : {}),
-      }),
-      signal: controller.signal,
-    });
+      "generate",
+    );
     if (!r.ok) {
-      const err = await r.json();
+      const err = await responseJson(r, "generate");
       throw Error(err.error?.message || `HTTP ${r.status}`);
     }
     session = r.headers.get("x-session-id") || "";
@@ -310,7 +320,9 @@ $("chat-form").onsubmit = async (e) => {
     session = "";
     $("session-info").textContent = "上次请求未完成；下一次将新建会话。";
     notify(
-      e.name === "AbortError" ? "已停止请求；上游可能已开始生成。" : e.message,
+      e.name === "AbortError"
+        ? "已停止请求；上游可能已开始生成。"
+        : browserError(e, "generate"),
       true,
     );
   } finally {
