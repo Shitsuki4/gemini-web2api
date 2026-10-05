@@ -3,6 +3,7 @@ export class ApiError extends Error {
     public status: number,
     public code: string,
     message: string,
+    public retryAfter?: number,
   ) {
     super(message);
   }
@@ -33,7 +34,7 @@ export function errorResponse(error: unknown) {
       },
     },
     e.status,
-    e.status === 429 ? { "Retry-After": "60" } : {},
+    e.status === 429 ? { "Retry-After": String(e.retryAfter ?? 60) } : {},
   );
 }
 export async function readLimited(response: Response | Request, max: number) {

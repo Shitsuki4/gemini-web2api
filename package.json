@@ -23,7 +23,8 @@
     "setup:secrets": "node scripts/init-secrets.mjs",
     "smoke:media": "node scripts/smoke-media.mjs",
     "smoke:spark": "node scripts/smoke-spark.mjs",
-    "smoke:image-chat": "node scripts/smoke-image-chat.mjs"
+    "smoke:image-chat": "node scripts/smoke-image-chat.mjs",
+    "watch:login": "node scripts/watch-login.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261004.1",

@@ -11,9 +11,12 @@ export class TestAccount extends GeminiAccount {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/test/alarm") {
+      await this.testState.storage.deleteAlarm();
       await this.alarm();
       return new Response("ok");
     }
+    if (path === "/test/alarm-at")
+      return Response.json({ at: await this.testState.storage.getAlarm() });
     if (path === "/test/storage") {
       const body = (await request.json()) as any;
       if (body.put) await this.testState.storage.put(body.put);

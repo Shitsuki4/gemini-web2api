@@ -83,9 +83,26 @@ async function load() {
             `${a.id} · ${a.enabled ? "已启用" : "已暂停"} · ${a.health}`,
             [
               button("检测/续期", async () => {
-                await api(`accounts/${a.id}/refresh`, "POST", {});
-                notify("Cookie 已续期，页面登录态有效。");
+                const r = await api(`accounts/${a.id}/refresh`, "POST", {});
+                const next = r.maintenance?.nextAttemptAt;
+                notify(
+                  r.message +
+                    (next
+                      ? ` 下次检查：${new Date(next * 1000).toLocaleString()}`
+                      : ""),
+                  !r.ok,
+                );
                 await load();
+              }),
+              button("保活状态", async () => {
+                const r = await api(`accounts/${a.id}/status`);
+                const m = r.maintenance;
+                notify(
+                  m
+                    ? `保活：${m.status}；票据：${m.ticket?.code || m.ticket?.status || "待检查"}；SIDCC：${m.sidcc?.code || m.sidcc?.status || "待检查"}；页面：${m.page?.code || m.page?.status || "待检查"}；下次检查：${new Date(m.nextAttemptAt * 1000).toLocaleString()}`
+                    : "尚未进行保活检查",
+                  !!m && m.status !== "healthy",
+                );
               }),
               button(a.enabled ? "暂停" : "启用", async () => {
                 await api(`accounts/${a.id}`, "PUT", { enabled: !a.enabled });

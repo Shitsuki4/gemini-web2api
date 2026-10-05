@@ -15,6 +15,7 @@ import {
   envelopeLines,
   upstreamFailure,
 } from "./protocol";
+import { refreshLogin, retrySeconds } from "./refresh";
 export const ORIGIN = "https://gemini.google.com";
 export function parseCookies(cookie: string) {
   const out = new Map<string, string>();
@@ -52,7 +53,12 @@ export function mergeCookies(cookie: string, headers: string[]) {
     if (i < 1) continue;
     const name = first.slice(0, i).trim(),
       value = first.slice(i + 1);
-    if (/max-age=0(?:;|$)/i.test(h) || !value) jar.delete(name);
+    const age = /;\s*max-age\s*=\s*(-?\d+)\s*(?:;|$)/i.exec(h);
+    const expires = /;\s*expires\s*=\s*([^;]+)/i.exec(h);
+    const expired = age
+      ? Number(age[1]) <= 0
+      : !!expires && Date.parse(expires[1]) <= Date.now();
+    if (expired || !value) jar.delete(name);
     else jar.set(name, value);
   }
   return [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
@@ -154,6 +160,11 @@ export class GeminiClient {
       now() - (this.credentials.fetchedAt || 0) < 1200
     )
       return;
+    // A failed forced probe must not leave apparently fresh cached page tokens.
+    if (this.credentials.fetchedAt) {
+      this.credentials.fetchedAt = 0;
+      await this.save();
+    }
     const r = await this.send(ORIGIN + "/" + surface, {
       headers: { Accept: "text/html" },
     });
@@ -167,7 +178,9 @@ export class GeminiClient {
     }
     if (!r.ok) {
       await r.body?.cancel();
-      throw upstreamFailure(r.status);
+      const error = upstreamFailure(r.status);
+      error.retryAfter = retrySeconds(r.headers.get("retry-after"));
+      throw error;
     }
     const tokens = pageTokens(
       new TextDecoder().decode(await readLimited(r, 8 * 1024 * 1024)),
@@ -210,41 +223,13 @@ export class GeminiClient {
     return h;
   }
   async rotate() {
-    const jar = parseCookies(this.credentials.cookie),
-      subset = ["__Secure-1PSID", "__Secure-1PSIDTS"]
-        .filter((k) => jar.has(k))
-        .map((k) => `${k}=${jar.get(k)}`)
-        .join("; ");
-    if (!jar.has("__Secure-1PSID"))
-      throw new ApiError(
-        502,
-        "refresh_unavailable",
-        "Import __Secure-1PSID to enable automatic refresh",
-      );
-    const headers = {
-      "Content-Type": "application/json",
-      Origin: "https://accounts.google.com",
-      Referer: "https://accounts.google.com/",
-      Cookie: subset,
-    };
-    const r = await this.send(
-      "https://accounts.google.com/RotateCookies",
-      { method: "POST", headers, body: '[000,"-0000000000000000000"]' },
-      false,
-    );
-    const set = r.headers.getSetCookie();
-    await r.body?.cancel();
-    if (!r.ok) throw upstreamFailure(r.status);
-    if (!set.some((s) => s.startsWith("__Secure-1PSIDTS=")))
-      throw new ApiError(
-        502,
-        "refresh_no_ticket",
-        "Cookie rotation did not issue a fresh login ticket; re-import may be required",
-      );
-    this.credentials.cookie = mergeCookies(this.credentials.cookie, set);
-    this.credentials.refreshedAt = now();
-    await this.save();
-    await this.tokens(true);
+    return refreshLogin({
+      credentials: this.credentials,
+      save: () => this.save(),
+      send: (url, init) => this.send(url, init, false),
+      tokens: () => this.tokens(true),
+      merge: mergeCookies,
+    });
   }
   async generate(
     input: GenerateInput,
@@ -271,7 +256,28 @@ export class GeminiClient {
         "spark_context_missing",
         "Spark continuation context is missing; start a new session",
       );
-    await this.tokens(false, model.spark ? "spark" : "app");
+    // Sustained generation traffic can keep alarms behind the account lock.
+    // Run an already-due round before submission, never in the middle of a turn.
+    const due =
+      this.credentials.maintenance?.nextAttemptAt ??
+      (this.credentials.importedAt ? this.credentials.importedAt + 15 : 0);
+    if (due && now() >= due) await this.rotate();
+    try {
+      await this.tokens(false, model.spark ? "spark" : "app");
+    } catch (e) {
+      // Recover only before any generation/upload is submitted. Never replay a
+      // StreamGenerate failure here: a task could already have been accepted.
+      // The existing explicit HTTP-400 token correction below is unchanged.
+      if (
+        !(e instanceof ApiError) ||
+        e.code !== "login_expired" ||
+        now() < (this.credentials.maintenance?.nextAttemptAt || 0)
+      )
+        throw e;
+      const maintenance = await this.rotate();
+      if (maintenance.page?.status !== "ok") throw e;
+      await this.tokens(false, model.spark ? "spark" : "app");
+    }
     const refs = [];
     for (const file of input.files) {
       const ref = await this.upload(file);

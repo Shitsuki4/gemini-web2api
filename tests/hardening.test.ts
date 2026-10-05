@@ -136,14 +136,20 @@ describe("validation and safe upstream handling", () => {
       },
       new AbortController().signal,
       async (url, init) => {
-        if (String(url).includes("RotateCookies")) {
+        if (
+          String(url).endsWith("/RotateCookies") &&
+          String(init?.body).startsWith("[000,")
+        ) {
           const h = new Headers(init?.headers);
           expect(h.get("cookie")).toBe(
             "__Secure-1PSID=SID; __Secure-1PSIDTS=OLD",
           );
           expect(init?.body).toBe('[000,"-0000000000000000000"]');
           return new Response(null, {
-            headers: { "set-cookie": "__Secure-1PSIDTS=NEW; Secure; Path=/" },
+            headers: {
+              "set-cookie":
+                "__Secure-1PSIDTS=NEW; Domain=.google.com; Secure; Path=/",
+            },
           });
         }
         return new Response('"SNlM0e":"new-xsrf","cfb2h":"new-build"');
@@ -151,6 +157,6 @@ describe("validation and safe upstream handling", () => {
     );
     await c.rotate();
     expect(creds.cookie).toContain("__Secure-1PSIDTS=NEW");
-    expect(saved).toBe(2);
+    expect(saved).toBeGreaterThanOrEqual(4);
   });
 });

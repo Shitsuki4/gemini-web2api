@@ -45,6 +45,16 @@
 
 AES-GCM 使用随机 IV；附加认证数据包含 DO ID 和存储键，防止密文被搬到另一个账号/记录后继续解密。它保护持久化内容，但不能防止拥有部署控制权的人读取运行时秘密。Google 仍会收到用户输入及上传文件。
 
+## Login maintenance state machine
+
+`src/gemini/refresh.ts` owns independent PSIDTS, SIDCC and page-token maintenance.
+DO credentials persist attempt/completion times and the next allowed attempt before network I/O.
+Partial cookie updates survive later failures. SIDCC already issued with the short ticket avoids a redundant rotation POST.
+Alarms normally run every 600 seconds, with explicit server backoff and account serialization.
+A generation can perform due maintenance before submission so sustained traffic cannot starve alarms.
+Maintenance updates D1 `last_refresh` but not inference health/cooldown. No Cron, browser bridge, or new storage service is required.
+See [operations](operations.md) for the state meanings and bounded observation command.
+
 ## 非等价能力
 
 - Workers 不能复制参考 Go 项目的 Chrome TLS/HTTP2 指纹。

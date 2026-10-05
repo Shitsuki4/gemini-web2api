@@ -46,7 +46,7 @@ Cookie 轮换本次返回过 HTTP 429，而随后生成仍成功；轮换失败�
 
 ## 无 Cron 的维护
 
-启用账号通过 DO Alarm 约每 15 分钟尝试轮换 Cookie并清理状态；视频期间更频繁轮询。停用账号不生成/续期，低频维护数据。Alarm 时机不是精确计时 SLA，平台重试或繁忙会延迟。默认配置没有 Cron，因此不会删除或占用账号已有的 Cron 任务。
+启用账号通过 DO Alarm 正常约每 10 分钟尝试轮换 Cookie并清理状态；视频期间更频繁轮询。停用账号不生成/续期，低频维护数据。Alarm 时机不是精确计时 SLA，平台重试或繁忙会延迟。默认配置没有 Cron，因此不会删除或占用账号已有的 Cron 任务。
 
 请求元数据 30 天、统计 365 天。若已删除最后一个账号，无 Alarm 继续清理 D1，可手动执行以下**明确删除过期日志**的命令：
 
@@ -81,3 +81,39 @@ npx wrangler d1 execute DB --remote --command "DELETE FROM requests WHERE create
 建立 `.dev.vars`，只放 ADMIN_KEY、API_KEY、ENCRYPTION_KEY；具体值使用开发专用密钥，不要复制生产 Cookie 到测试夹具。然后执行 `npm run db:local` 和 `npm run dev`。已有 `.dev.vars` 不会被初始化脚本覆盖，需要自行确认它属于新版本。
 
 `npm test` 使用独立内存数据库和假的 Google 响应，不需要 `.dev.vars`。不要将 `tests/harness.ts` 设为生产入口；`wrangler.toml` 始终指向 `src/index.ts`。
+
+## 长期登录维护（2026-10-05 修订）
+
+仅在 Cloudflare 内运行：导入后约 15 秒首次维护，正常每 600 秒一次；视频轮询、持续生成不会永久饿死维护。每次维护分开记录三项：
+
+1. **短期票据**：`POST accounts.google.com/RotateCookies`，保留 JSPB 哨兵字面量 `[000,"-0000000000000000000"]`，只发送 `__Secure-1PSID` / `__Secure-1PSIDTS`。必须实际收到有效的 `__Secure-1PSIDTS` 才更新 `refreshed_at` / D1 `last_refresh`。
+2. **SIDCC**：如果第一步已换发 `SIDCC` 或 `__Secure-1PSIDCC`，直接复用，避免重复 POST 触发 429；否则 GET `RotateCookiesPage` 解析产品 658 的会话参数，再 POST `[658,"会话ID"]`。不保存或公开该参数。
+3. **页面检查**：独立 GET `/app` 更新页面令牌。前两步 401/429 不会直接跳过页面检查；页面能打开并不证明短期票据已换发。
+
+已取得的 Cookie 逐步加密保存；失败不会丢弃其他步骤的成功结果。只接受 accounts 响应里 `.google.com` 共享域、允许的 Cookie 名称，不把 accounts 的 host-only Cookie 发给 Gemini。删除/负 Max-Age/已过期 Cookie 不计为续期，Cookie 改变或强制页面检查时使旧令牌缓存失效。
+
+### 状态和重试
+
+管理台的“保活状态”读取 `/admin/accounts/{id}/status`；“检测/续期”执行一次受退避约束的维护。
+
+- `healthy`：本轮票据、SIDCC、页面均成功，**不表示永久登录**。
+- `degraded`：部分成功；查看 `ticket`、`sidcc`、`page` 各自的结果。
+- `reimport_required`：票据认证失败且页面登录已失效；先在浏览器确认登录，再更新原账号。
+- `running`：维护进行中或上次在处理中断；后续由 Alarm 按持久化时间恢复。
+
+首次一般错误等待 10 分钟，已确认失效的认证错误等待 30 分钟；连续失败指数退避，普通退避最多 6 小时。上游 `Retry-After` 优先（解析上限 24 小时）。**只有 SIDCC 失败、但短期票据与页面成功时不指数延长正常续期周期**，否则可能反而错过票据有效期。429 后不立刻向同一轮换端点补发第二个请求。
+
+`lastAttemptAt`、`lastCompletedAt`、`nextAttemptAt`、失败次数和各步骤时间都在 DO 加密凭据中持久化。部署/对象重建不清空退避；手动过早重试返回 `429 refresh_backoff` 和准确的 `Retry-After` 秒数。停用账号不发起登录维护，只做每日清理；重新导入凭据才重置维护状态。
+
+D1 的 `health` / `cooldown_until` 仍表示生成健康度，不被后台部分失败覆盖。维护异常也会重新安排 Alarm。生成开始前可执行到期维护；如首次获取页面令牌明确登录失效，最多补一次尚未处于退避期的维护；这不会新增对已提交生成的重放（原有显式 HTTP 400 令牌纠正重试保持不变）。
+
+### 可重复的无人值守验收
+
+```powershell
+# 事先设置 GATEWAY_URL、ADMIN_KEY；额外设置 API_KEY 才能加 --verify-chat
+npm run watch:login -- --account acc_你的账号ID --minutes 35 --verify-chat
+```
+
+此脚本只每分钟读取状态，**不调用 refresh、不导入 Cookie、不连接 Roxy**。必须观察到至少两次新的自动票据换发且导入时间未改变才算通过；`--verify-chat` 最后额外发出一次真实文本生成。脚本有 1–120 分钟边界，失败非零退出。它只是验收工具，不需要常驻，也不是运行时依赖。
+
+新浏览器会话可能采用设备绑定；401 也可能来自普通过期或其他认证原因，不能仅凭一个状态码断定 DBSC。本项目不会提取设备私钥、绕过验证或隐式切换出口。若重新导入后仍持续 401，可参考 Go 项目的说明，在 Firefox 手动重新登录并导出兼容会话再验证；不保证换浏览器必然解决。多个 10 分钟周期的成功只能证明观察窗口内有效，不能替代数天稳定性验证。

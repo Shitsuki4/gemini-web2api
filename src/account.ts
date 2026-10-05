@@ -19,6 +19,7 @@ import {
   unseal,
 } from "./util";
 import { GeminiClient, validateCookie } from "./gemini/client";
+import { maintenanceMessage, REFRESH_INTERVAL } from "./gemini/refresh";
 import { socketTransport } from "./gemini/socket";
 import { delta } from "./gemini/protocol";
 import { cleanMediaText, missingArtifactMessage } from "./media";
@@ -127,8 +128,15 @@ export class GeminiAccount implements DurableObject {
         )
       : undefined;
   }
-  private async schedule(delay = 900000) {
-    const at = Date.now() + delay,
+  private async schedule(delay?: number) {
+    const due =
+      this.creds?.maintenance?.nextAttemptAt ??
+      (this.creds?.importedAt
+        ? this.creds.importedAt + 15
+        : now() + REFRESH_INTERVAL);
+    const wait =
+      delay ?? (this.enabled ? Math.max(30, due - now()) * 1000 : 86400000);
+    const at = Date.now() + wait,
       old = await this.state.storage.getAlarm();
     if (old === null || old > at) await this.state.storage.setAlarm(at);
   }
@@ -145,6 +153,7 @@ export class GeminiAccount implements DurableObject {
           this.accountId = b.accountId;
           this.creds = {
             cookie: validateCookie(b.cookie),
+            importedAt: now(),
             userAgent:
               typeof b.userAgent === "string" &&
               b.userAgent.length < 512 &&
@@ -159,7 +168,7 @@ export class GeminiAccount implements DurableObject {
           };
           await this.state.storage.put("accountId", this.accountId);
           await this.save();
-          await this.schedule(60000);
+          await this.schedule(15000);
           return json({ ok: true, imported: true });
         } finally {
           this.busy = false;
@@ -173,7 +182,9 @@ export class GeminiAccount implements DurableObject {
           const b = await readJson(request);
           this.enabled = b.enabled === true;
           await this.state.storage.put("enabled", this.enabled);
-          await this.schedule(this.enabled ? 60000 : 86400000);
+          await this.state.storage.setAlarm(
+            Date.now() + (this.enabled ? 15000 : 86400000),
+          );
           return json({ ok: true });
         } finally {
           this.busy = false;
@@ -199,6 +210,8 @@ export class GeminiAccount implements DurableObject {
           configured: !!this.creds,
           busy: this.busy,
           enabled: this.enabled,
+          imported_at: this.creds?.importedAt || 0,
+          maintenance: this.creds?.maintenance || null,
           tokens_at: this.creds?.fetchedAt || 0,
           refreshed_at: this.creds?.refreshedAt || 0,
           cookie_names:
@@ -229,10 +242,18 @@ export class GeminiAccount implements DurableObject {
       let streaming = false;
       try {
         if (path === "/refresh") {
-          await this.client(this.timeout()).rotate();
-          await this.health("refreshed");
-          await this.schedule();
-          return json({ ok: true, refreshed_at: this.creds!.refreshedAt });
+          try {
+            const maintenance = await this.maintain();
+            return json({
+              ok: maintenance.status === "healthy",
+              renewed: maintenance.ticket?.status === "ok",
+              refreshed_at: this.creds!.refreshedAt || 0,
+              maintenance,
+              message: maintenanceMessage(maintenance),
+            });
+          } finally {
+            await this.schedule();
+          }
         }
         if (path === "/models") {
           const frames = await this.client(this.timeout()).rpc("otAQ7b", []);
@@ -627,6 +648,16 @@ export class GeminiAccount implements DurableObject {
     bucket.count++;
     await this.state.storage.put("rate", bucket);
   }
+  private async maintain() {
+    try {
+      return await this.client(this.timeout()).rotate();
+    } finally {
+      // Maintenance must not overwrite inference health or its cooldown.
+      await this.env.DB.prepare("UPDATE accounts SET last_refresh=? WHERE id=?")
+        .bind(this.creds?.refreshedAt || 0, this.accountId)
+        .run();
+    }
+  }
   private async health(health: string, cooldown = 0) {
     await this.env.DB.prepare(
       "UPDATE accounts SET health=?,last_refresh=?,cooldown_until=? WHERE id=?",
@@ -795,6 +826,9 @@ export class GeminiAccount implements DurableObject {
         await this.schedule(86400000);
         return;
       }
+      if (this.creds && now() >= (this.creds.maintenance?.nextAttemptAt || 0)) {
+        await this.maintain();
+      }
       const video = await this.state.storage.get<string>("activeVideo");
       if (video) {
         const j = await this.privateGet<VideoJob>("video:" + video);
@@ -884,18 +918,12 @@ export class GeminiAccount implements DurableObject {
           }
         } else await this.state.storage.delete("activeVideo");
       }
-      if (this.creds && now() - (this.creds.refreshedAt || 0) >= 900) {
-        try {
-          await this.client(this.timeout()).rotate();
-          await this.health("refreshed");
-        } catch (e) {
-          await this.health(e instanceof ApiError ? e.code : "refresh_failed");
-        }
-      }
       await this.cleanup();
       await this.schedule();
     } finally {
       this.busy = false;
+      // Always re-arm, including storage/transport failures and DO restarts.
+      await this.schedule();
     }
   }
   private async cleanup() {

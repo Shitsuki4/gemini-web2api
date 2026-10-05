@@ -47,3 +47,12 @@
 - 实测网页模型头 hash 为 `56fdd199312815e2`、slot 11=`2`，保留观察到的完整 capability 序列和 slot 19 时间戳结构。不凭该请求名声明真实后端模型版本。浏览器中，缩短后的模型头曾产生无答案终止；完整头的同适配器返回了测试答案，但这个对照本身不等于 Cloudflare 成功。
 - 浏览器挑战字段 slot 3/4 不复制、不伪造；没有引入验证码处理、外部转发或常驻 Roxy。抓包不作为仓库附件，只保留合成协议测试。
 - 同时修复 `/app` 页面 CSP 响应头约 21 KiB 超出旧 8 KiB 限制的问题：header field 上限 32 KiB、总头部 64 KiB，状态行/分块行仍 8 KiB。
+
+## 本次登录维护对照
+
+- Go `internal/app/rotate.go`：采用双轮换流程、JSPB 哨兵原样发送、最小 Cookie 对、产品 658 的页面参数、首次 15 秒/正常 10 分钟、独立保存成功票据。其注释明确区分 PSIDTS 短期票据与 SIDCC，且指出部分 Chrome 会话的设备绑定限制。
+- 接手前本仓库 `cf94c7d` 的 `refreshSession` / `mergeSetCookies`：保留独立 GET `/app` 与响应 Cookie 持久化的原则；不能把页面令牌刷新当作票据长期续期。
+- Sophomoresty 的 `gemini-cookie-sync-extension` 是 popup 手动导出/同步入口，未提供自动运行的 background 续期；没有把它误当作纯 Cloudflare 保活实现。one880808 与 Sophomoresty 的 Worker 未发现这两条 PSIDTS/SIDCC 自动轮换流程。
+- 此版新增而非直接照搬的保护：跨部署持久退避、三项独立状态、SIDCC 已随短票下发时去除重复 POST、SIDCC 单项失败不拖延短票维护、正确 Cookie 删除/共享域校验、生成健康度与维护状态分离。
+
+线上首次检查旧会话时两条轮换均 401、页面已失效；一次性更新原账号后 Cloudflare Alarm 成功换发 PSIDTS，并附带 `__Secure-1PSIDCC`。紧随其后的额外 SIDCC POST 返回 429，促成了上面的重复请求消除。后续多轮验收见 [验证记录](verification.md)，不是仅根据参考项目 README 声称可用。

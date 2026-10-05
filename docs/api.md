@@ -136,3 +136,37 @@ JSON 模式仅 `response_format:{"type":"json_object"}`；Responses 可用 `text
 `before` 分页以秒为粒度，同一秒多条记录可能跨页遗漏；当前管理台定位为最近请求查看，不是审计导出系统。
 
 常见错误与处理见 [运维](operations.md)。
+
+### 账号保活状态 API
+
+`GET /admin/accounts/{id}/status` 新增 `imported_at` 与 `maintenance`。后者包含 `status`、`lastAttemptAt`、`lastCompletedAt`、`nextAttemptAt`、`failures`、`lastTicketAt`、`lastSidccAt`、`lastPageAt`，以及 `ticket` / `sidcc` / `page` 三个结果。各步骤只返回状态、时间、错误码和 Cookie **名称**，不返回 Cookie、页面令牌或会话参数。所有时间为 Unix 秒；尚未检查时 `maintenance:null`。
+
+`POST /admin/accounts/{id}/refresh` 完成一轮诊断后返回 HTTP 200：
+
+```json
+{
+  "ok": false,
+  "renewed": false,
+  "refreshed_at": 0,
+  "maintenance": {
+    "status": "reimport_required",
+    "lastAttemptAt": 1791162350,
+    "nextAttemptAt": 1791164150,
+    "failures": 1,
+    "ticket": {
+      "status": "error",
+      "at": 1791162350,
+      "code": "refresh_http_401"
+    },
+    "sidcc": {
+      "status": "error",
+      "at": 1791162350,
+      "code": "refresh_http_401"
+    },
+    "page": { "status": "error", "at": 1791162350, "code": "login_expired" }
+  },
+  "message": "自动续期未恢复登录，请更新原账号。"
+}
+```
+
+HTTP 200 只表示诊断完成；必须检查 `ok` / `renewed` 和各步骤。`ok:true` 表示三项成功；`renewed:true` 只表示本轮确实换发了短期票据。退避期内不发上游请求，返回 `429 refresh_backoff` 与 `Retry-After`；账号停用时返回 `503 account_disabled`。

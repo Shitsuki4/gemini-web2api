@@ -21,7 +21,29 @@ export interface AccountRow {
   health: string;
   cooldown_until: number;
 }
+export interface RefreshStep {
+  status: "ok" | "error" | "skipped";
+  at: number;
+  code?: string;
+  cookies?: string[];
+}
+export interface LoginMaintenance {
+  status: "running" | "healthy" | "degraded" | "reimport_required";
+  lastAttemptAt: number;
+  lastCompletedAt?: number;
+  nextAttemptAt: number;
+  failures: number;
+  intervalSeconds?: number;
+  lastTicketAt?: number;
+  lastSidccAt?: number;
+  lastPageAt?: number;
+  ticket?: RefreshStep;
+  sidcc?: RefreshStep;
+  page?: RefreshStep;
+}
 export interface Credentials {
+  importedAt?: number;
+  maintenance?: LoginMaintenance;
   cookie: string;
   userAgent?: string;
   xsrf?: string;

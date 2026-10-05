@@ -6,6 +6,9 @@ import { seal, unseal } from "../src/util";
 let mf: Miniflare;
 let account = "";
 let calls = 0;
+let maintenanceCalls = 0;
+let rejectRotation = false;
+let rejectPage = false;
 let lastPrompt = "";
 let lastPayload: any[] = [];
 let rejectUpstream = false;
@@ -71,6 +74,24 @@ beforeAll(async () => {
     },
     outboundService: async (request) => {
       const url = new URL(request.url);
+      if (url.pathname === "/RotateCookies") {
+        maintenanceCalls++;
+        if (rejectRotation)
+          return new Response("unauthorized", { status: 401 });
+        const ticket = (await request.text()).startsWith("[000,");
+        return new Response("[]", {
+          headers: {
+            "set-cookie": `${ticket ? "__Secure-1PSIDTS" : "SIDCC"}=PRIVATE_RENEWED; Domain=.google.com; Path=/; Secure`,
+          },
+        });
+      }
+      if (url.pathname === "/RotateCookiesPage")
+        return new Response("init('123456789123',658.0,0.0,0.0,600.0)");
+      if (["/app", "/spark"].includes(url.pathname) && rejectPage)
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://accounts.google.com/ServiceLogin" },
+        });
       if (["/app", "/spark"].includes(url.pathname))
         return new Response(
           '"SNlM0e":"xsrf_test","cfb2h":"boq_test","qKIAYe":"push_test","Ylro7b":"pctx_test"',
@@ -547,5 +568,102 @@ describe("Spark persisted sessions in workerd", () => {
     });
     expect(wrong.status).toBe(400);
     expect(calls).toBe(before);
+  });
+});
+
+describe("login maintenance alarm lifecycle", () => {
+  it("schedules first import promptly, keeps inference health separate, honors persisted due time", async () => {
+    const { id, stub, db, objectId } = await freshAccount();
+    const alarm = async () =>
+      ((await (await stub.fetch("https://test/test/alarm-at")).json()) as any)
+        .at;
+    expect(await alarm()).toBeLessThanOrEqual(Date.now() + 16000);
+    await db
+      .prepare(
+        "UPDATE accounts SET health='inference_error',cooldown_until=123 WHERE id=?",
+      )
+      .bind(id)
+      .run();
+    const before = maintenanceCalls;
+    await stub.fetch("https://test/test/alarm");
+    const status = (await (
+      await req(`/admin/accounts/${id}/status`, undefined, admin)
+    ).json()) as any;
+    expect(status.maintenance.status).toBe("healthy");
+    expect(
+      status.maintenance.nextAttemptAt - status.maintenance.lastCompletedAt,
+    ).toBe(600);
+    expect(await alarm()).toBeGreaterThan(Date.now() + 590000);
+    expect(await alarm()).toBeLessThan(Date.now() + 601000);
+    const row = await db
+      .prepare(
+        "SELECT health,cooldown_until,last_refresh FROM accounts WHERE id=?",
+      )
+      .bind(id)
+      .first();
+    expect(row?.health).toBe("inference_error");
+    expect(row?.cooldown_until).toBe(123);
+    expect(row?.last_refresh).toBe(status.refreshed_at);
+    const raw = await storage(stub);
+    expect(JSON.stringify(raw)).not.toContain("PRIVATE_RENEWED");
+    const creds = await unseal<any>(
+      raw.credentials,
+      btoa("k".repeat(32)),
+      objectId,
+    );
+    expect(creds.maintenance.nextAttemptAt).toBe(
+      status.maintenance.nextAttemptAt,
+    );
+    await stub.fetch("https://test/test/alarm");
+    expect(maintenanceCalls - before).toBe(2);
+    const retry = await req(`/admin/accounts/${id}/refresh`, {}, admin);
+    expect(retry.status).toBe(429);
+    expect(Number(retry.headers.get("retry-after"))).toBeGreaterThan(590);
+    expect(await retry.text()).toContain("refresh_backoff");
+    expect(maintenanceCalls - before).toBe(2);
+  });
+  it("reports manual failure honestly, schedules durable backoff and clears stale token age", async () => {
+    const { id, stub } = await freshAccount();
+    rejectRotation = true;
+    rejectPage = true;
+    try {
+      const r = (await (
+        await req(`/admin/accounts/${id}/refresh`, {}, admin)
+      ).json()) as any;
+      expect(r.ok).toBe(false);
+      expect(r.renewed).toBe(false);
+      expect(r.maintenance.status).toBe("reimport_required");
+      expect(r.maintenance.nextAttemptAt - r.maintenance.lastCompletedAt).toBe(
+        1800,
+      );
+      const state = (await (
+        await req(`/admin/accounts/${id}/status`, undefined, admin)
+      ).json()) as any;
+      expect(state.tokens_at).toBe(0);
+      const before = maintenanceCalls;
+      await stub.fetch("https://test/test/alarm");
+      expect(maintenanceCalls).toBe(before);
+      const alarm = (await (
+        await stub.fetch("https://test/test/alarm-at")
+      ).json()) as any;
+      expect(alarm.at).toBeGreaterThan(Date.now() + 1790000);
+    } finally {
+      rejectRotation = false;
+      rejectPage = false;
+    }
+  });
+  it("disabled account makes no maintenance requests and keeps daily cleanup alarm", async () => {
+    const { id, stub } = await freshAccount();
+    await req(`/admin/accounts/${id}`, { enabled: false }, admin, "PUT");
+    const before = maintenanceCalls;
+    await stub.fetch("https://test/test/alarm");
+    expect((await req(`/admin/accounts/${id}/refresh`, {}, admin)).status).toBe(
+      503,
+    );
+    expect(maintenanceCalls).toBe(before);
+    const alarm = (await (
+      await stub.fetch("https://test/test/alarm-at")
+    ).json()) as any;
+    expect(alarm.at).toBeGreaterThan(Date.now() + 86390000);
   });
 });
