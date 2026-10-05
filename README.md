@@ -6,7 +6,9 @@
 
 > **Spark 新增为 Beta 实验入口，不是已验收能力。** 使用 `gemini-spark`；已实现真实 Spark tool 40、任务续接和答案事件解析，但当前 Cloudflare 实测仍有 `1061` / 无答案终止，网页适配器成功不等于云端成功。普通 Gemini 与图片链路不因此改为 Spark。见 [Spark 使用范围](docs/api.md#spark-beta实验性文本适配) 和[失败记录](docs/verification.md#spark-beta-追加验收2026-10-05)。
 
-> **登录保活已重做**：独立的 PSIDTS / SIDCC / 页面检查、持久化退避、首次 15 秒与正常 10 分钟维护；SIDCC 已随短票下发时不重复请求。管理台新增“保活状态”，不再把页面可用误报为长期续期成功。当前账号已实测连续 3 轮自动续票，距最后导入超过 35 分钟后文本/图片仍成功；这不等于数天或永久有效。用 `npm run watch:login -- --account acc_ID --minutes 35 --verify-chat` 做有界多轮验收，详见[运维说明](docs/operations.md#长期登录维护2026-10-05-修订)。
+> **登录保活已重做**：短期票据与页面检查独立调度、持久化退避，SIDCC 已随短票下发时不重复请求；管理台提供保活历史和脱敏页面诊断。首轮 35 分钟通过后曾复发，已修正页面失败拖慢续票的问题；后续 45 分钟窗口观察到 4 次新的自动换票，且同一导入约 5 小时后仍完成文本/图片实测。不同观察窗口与恢复操作分别记录，**不承诺数天或永久有效**。用 `npm run watch:login -- --account acc_ID --minutes 35 --verify-chat` 做有界验收，详见[运维说明](docs/operations.md#长期登录维护2026-10-05-修订)及[验收记录](docs/verification.md)。
+
+> **浏览器跨域 API 已补齐**：`/v1/`、`/v1beta/` 支持预检、鉴权请求与跨域 SSE/图片下载；`/admin/` 仍只允许同源访问。遇到 `Failed to fetch` 先区分网络/CORS 与上游错误，不自动重发生成。见[浏览器客户端说明](docs/api.md#浏览器客户端与-failed-to-fetch)。
 
 ## 能做什么
 
