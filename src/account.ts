@@ -25,6 +25,7 @@ import { delta } from "./gemini/protocol";
 import { cleanMediaText, missingArtifactMessage } from "./media";
 import { chatResponse, finishResult, responsesResponse } from "./api";
 import { eventStream, type EventSink } from "./sse";
+import { AccountGate } from "./gate";
 interface VideoJob {
   id: string;
   owner: string;
@@ -40,7 +41,10 @@ interface VideoJob {
   error?: { code: string; message: string };
 }
 export class GeminiAccount implements DurableObject {
-  private busy = false;
+  private gate = new AccountGate();
+  private get busy() {
+    return this.gate.busy;
+  }
   private creds?: Credentials;
   private accountId = "";
   private enabled = true;
@@ -147,7 +151,7 @@ export class GeminiAccount implements DurableObject {
       if (path === "/configure") {
         if (this.busy)
           throw new ApiError(429, "account_busy", "Account is busy");
-        this.busy = true;
+        this.gate.enter();
         try {
           const b = await readJson(request, 40000);
           this.accountId = b.accountId;
@@ -171,13 +175,13 @@ export class GeminiAccount implements DurableObject {
           await this.schedule(15000);
           return json({ ok: true, imported: true });
         } finally {
-          this.busy = false;
+          this.gate.release();
         }
       }
       if (path === "/enabled") {
         if (this.busy)
           throw new ApiError(429, "account_busy", "Account is busy");
-        this.busy = true;
+        this.gate.enter();
         try {
           const b = await readJson(request);
           this.enabled = b.enabled === true;
@@ -187,13 +191,13 @@ export class GeminiAccount implements DurableObject {
           );
           return json({ ok: true });
         } finally {
-          this.busy = false;
+          this.gate.release();
         }
       }
       if (path === "/delete") {
         if (this.busy)
           throw new ApiError(429, "account_busy", "Account is busy");
-        this.busy = true;
+        this.gate.enter();
         try {
           await this.state.storage.deleteAlarm();
           await this.state.storage.deleteAll();
@@ -202,13 +206,21 @@ export class GeminiAccount implements DurableObject {
           this.accountId = "";
           return json({ ok: true });
         } finally {
-          this.busy = false;
+          this.gate.release();
         }
       }
       if (path === "/status")
         return json({
           configured: !!this.creds,
-          busy: this.busy,
+          ...this.gate.snapshot(),
+          queue_capacity: 4,
+          queue_wait_ms: boundedInt(
+            this.env.ACCOUNT_QUEUE_WAIT_MS,
+            180000,
+            0,
+            180000,
+          ),
+          rate_limit: await this.rateStatus(),
           enabled: this.enabled,
           imported_at: this.creds?.importedAt || 0,
           maintenance: this.creds?.maintenance || null,
@@ -233,13 +245,19 @@ export class GeminiAccount implements DurableObject {
         return await this.getVideo(path.slice(8), request);
       if (!this.enabled)
         throw new ApiError(503, "account_disabled", "Account is disabled");
-      if (this.busy)
-        throw new ApiError(
-          429,
-          "account_busy",
-          "Account already has an active request",
+      if (path === "/generate" || path === "/videos")
+        await this.gate.acquire(
+          request.signal,
+          boundedInt(
+            request.headers.get("x-queue-wait-ms") ??
+              this.env.ACCOUNT_QUEUE_WAIT_MS,
+            180000,
+            0,
+            180000,
+          ),
+          4,
         );
-      this.busy = true;
+      else this.gate.enter();
       let streaming = false;
       try {
         if (path === "/refresh") {
@@ -608,9 +626,11 @@ export class GeminiAccount implements DurableObject {
                 await work(sink, signal);
               },
               () => {
-                this.busy = false;
+                this.gate.release();
               },
-              request.signal,
+              // Bound downstream writes/close as well as upstream generation:
+              // a disconnected or unread SSE must not retain the account forever.
+              this.timeout(request.signal),
             );
             this.state.waitUntil(stream.done);
             stream.response.headers.set(
@@ -626,11 +646,25 @@ export class GeminiAccount implements DurableObject {
         }
         throw new ApiError(404, "not_found", "Not found");
       } finally {
-        if (!streaming) this.busy = false;
+        if (!streaming) this.gate.release();
       }
     } catch (e) {
       return errorResponse(e);
     }
+  }
+  private async rateStatus() {
+    const current = now();
+    const bucket = await this.state.storage.get<{
+      minute: number;
+      count: number;
+    }>("rate");
+    const used = bucket?.minute === Math.floor(current / 60) ? bucket.count : 0;
+    return {
+      limit: 6,
+      used,
+      remaining: Math.max(0, 6 - used),
+      reset_at: (Math.floor(current / 60) + 1) * 60,
+    };
   }
   private async rateLimit() {
     const minute = Math.floor(now() / 60);
@@ -646,7 +680,8 @@ export class GeminiAccount implements DurableObject {
       throw new ApiError(
         429,
         "account_rate_limit",
-        "Account limit is six generation attempts per minute",
+        "Account limit is six generation attempts per minute; wait until the next minute before submitting again",
+        60 - (now() % 60),
       );
     bucket.count++;
     await this.state.storage.put("rate", bucket);
@@ -822,7 +857,7 @@ export class GeminiAccount implements DurableObject {
       await this.schedule(30000);
       return;
     }
-    this.busy = true;
+    this.gate.enter();
     try {
       if (!this.enabled) {
         await this.cleanup();
@@ -924,7 +959,7 @@ export class GeminiAccount implements DurableObject {
       await this.cleanup();
       await this.schedule();
     } finally {
-      this.busy = false;
+      this.gate.release();
       // Always re-arm, including storage/transport failures and DO restarts.
       await this.schedule();
     }

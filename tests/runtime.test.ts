@@ -68,6 +68,7 @@ beforeAll(async () => {
     d1Databases: { DB: "db" },
     bindings: {
       UPSTREAM_TRANSPORT: "fetch",
+      ACCOUNT_QUEUE_WAIT_MS: "1000",
       ADMIN_KEY: admin,
       API_KEY: apiKey,
       ENCRYPTION_KEY: btoa("k".repeat(32)),
@@ -563,6 +564,10 @@ describe("concurrency and ambiguous jobs", () => {
         messages: [{ role: "user", content: "overlap" }],
       });
       expect(busy.status).toBe(429);
+      expect(((await busy.json()) as any).error.code).toBe(
+        "account_queue_timeout",
+      );
+      expect(calls).toBe(before + 1);
     } finally {
       upstreamGate = undefined;
       release();
@@ -973,5 +978,94 @@ describe("OpenAI client session compatibility in workerd", () => {
       expect(((await r.json()) as any).error.code).toBe("not_found");
     }
     expect(calls).toBe(before);
+  });
+});
+
+describe("bounded pre-submission scheduling", () => {
+  it.each([false, true])(
+    "queues rather than submitting concurrently (stream=%s)",
+    async (stream) => {
+      const { id } = await freshAccount();
+      let release!: () => void;
+      upstreamGate = new Promise<void>((r) => {
+        release = r;
+      });
+      const before = calls;
+      const first = req("/v1/chat/completions", {
+        messages: [{ role: "user", content: "FIRST_QUEUED_TEST" }],
+      }).then(async (r) => {
+        expect(r.status).toBe(200);
+        return r.text();
+      });
+      let second: Promise<any> | undefined;
+      try {
+        for (let i = 0; i < 100 && calls === before; i++)
+          await new Promise((r) => setTimeout(r, 5));
+        expect(calls).toBe(before + 1);
+        second = req("/v1/chat/completions", {
+          stream,
+          messages: [{ role: "user", content: "SECOND_QUEUED_TEST" }],
+        }).then(async (r) => {
+          expect(r.status).toBe(200);
+          return r.text();
+        });
+        let status: any;
+        for (let i = 0; i < 30; i++) {
+          status = await (
+            await req(`/admin/accounts/${id}/status`, undefined, admin)
+          ).json();
+          if (status.queued === 1) break;
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        expect(status.queued).toBe(1);
+        expect(status.busy).toBe(true);
+        expect(status.busy_since).toBeGreaterThan(0);
+        expect(status.rate_limit.used).toBe(1);
+        expect(calls).toBe(before + 1);
+        upstreamGate = undefined;
+        release();
+        await first;
+        const text = await second;
+        if (stream) expect(text).toContain("data: [DONE]");
+        expect(calls).toBe(before + 2);
+        status = await (
+          await req(`/admin/accounts/${id}/status`, undefined, admin)
+        ).json();
+        expect(status.queued).toBe(0);
+        expect(status.busy).toBe(false);
+        expect(status.rate_limit.used).toBe(2);
+      } finally {
+        upstreamGate = undefined;
+        release();
+        await first;
+        await second;
+      }
+    },
+  );
+  it("preserves a real rate rejection and exact reset hint instead of pool_busy", async () => {
+    const { stub, id } = await freshAccount();
+    const minute = Math.floor(Date.now() / 60000);
+    await storage(stub, { put: { rate: { minute, count: 6 } } });
+    const before = calls;
+    const r = await req("/v1/chat/completions", {
+      messages: [{ role: "user", content: "not submitted" }],
+    });
+    expect(r.status).toBe(429);
+    expect(((await r.json()) as any).error.code).toBe("account_rate_limit");
+    expect(Number(r.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(Number(r.headers.get("retry-after"))).toBeLessThanOrEqual(60);
+    expect(calls).toBe(before);
+    const s: any = await (
+      await req(`/admin/accounts/${id}/status`, undefined, admin)
+    ).json();
+    expect(s.busy).toBe(false);
+    expect(s.rate_limit.remaining).toBe(0);
+    await storage(stub, { put: { rate: { minute: minute - 1, count: 6 } } });
+    const next = await req("/v1/chat/completions", {
+      messages: [{ role: "user", content: "new minute" }],
+    });
+    expect(next.status).toBe(200);
+    await next.text();
+    expect(calls).toBe(before + 1);
   });
 });

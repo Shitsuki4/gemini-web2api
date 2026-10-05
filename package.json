@@ -18,6 +18,7 @@
     "sync:roxy": "node scripts/sync-roxy.mjs",
     "smoke": "node scripts/smoke.mjs",
     "smoke:openai": "node scripts/smoke-openai.mjs",
+    "smoke:concurrency": "node scripts/smoke-concurrency.mjs",
     "format": "prettier --write src tests public scripts docs README.md package.json tsconfig.json .github/workflows/ci.yml",
     "format:check": "prettier --check src tests public scripts docs README.md package.json tsconfig.json .github/workflows/ci.yml",
     "build": "wrangler deploy --dry-run --outdir dist",

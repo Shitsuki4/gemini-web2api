@@ -9,15 +9,23 @@ export function eventStream(
   requestSignal: AbortSignal,
 ) {
   const abort = new AbortController();
-  const transform = new TransformStream<Uint8Array, Uint8Array>();
+  let streamController!: TransformStreamDefaultController<Uint8Array>;
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      streamController = controller;
+    },
+  });
   const writer = transform.writable.getWriter();
   const encoder = new TextEncoder();
   let closed = false;
   const cancel = () => {
+    if (abort.signal.aborted) return;
     abort.abort();
-    void writer
-      .abort(new DOMException("Aborted", "AbortError"))
-      .catch(() => {});
+    const reason = new DOMException("Aborted", "AbortError");
+    // writer.abort alone may wait behind an in-flight transform/queued close.
+    // Error both stream sides synchronously to unblock backpressured writes.
+    streamController.error(reason);
+    void writer.abort(reason).catch(() => {});
   };
   if (requestSignal.aborted) cancel();
   else requestSignal.addEventListener("abort", cancel, { once: true });
@@ -66,9 +74,14 @@ export function eventStream(
     } finally {
       closed = true;
       clearInterval(timer);
-      requestSignal.removeEventListener("abort", cancel);
-      await writer.close().catch(() => {});
-      onDone();
+      try {
+        // Keep cancellation/deadline wired until pending downstream writes and
+        // close settle; otherwise an unread response can hold the account lock.
+        await writer.close().catch(() => {});
+      } finally {
+        requestSignal.removeEventListener("abort", cancel);
+        onDone();
+      }
     }
   })();
   return {

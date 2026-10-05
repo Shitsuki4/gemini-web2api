@@ -138,3 +138,16 @@ npm run watch:login -- --account acc_你的账号ID --minutes 35 --verify-chat
 可用 `npm run smoke:openai` 做一次有界验收：**7 次真实生成**，覆盖自定义 ID 下的非流式、SSE、两种工具调用格式及模拟工具结果回传，还有不重放历史的远程续聊。脚本检查 `finish_reason: tool_calls`、工具名、JSON 字符串参数及 SSE `[DONE]`，并非只看 HTTP 200。工具本身不执行、不查询天气；回传结果是本机生成的测试数据。请求开始间隔至少 12 秒，不重试；建议在原账号一分钟没有其他生成时单独运行，任一失败立即停止。环境变量与 `smoke` 相同，额外可设置 `EXPECTED_ACCOUNT` 来断言始终使用原账号。
 
 `invalid_session_id` 表示明确的网关 ID 格式或字段类型有问题；`conflicting_session_ids` 表示几个字段指定了不同的真实网关会话。不要通过重新导入 Cookie 处理这类本地参数错误。文件/视频资源 ID 仍严格校验，不能用客户端会话 UUID 下载资源。
+
+## 429：账号占用、等待队列和每分钟预算
+
+单个 Gemini 登录同一时刻只执行一个生成，不等于每个模型各有一个并发额度。长请求（尤其图片/工具/Spark）未结束时，另一个请求不能同时提交到同一个上游登录。
+
+- 单账号池或显式指定网关续聊账号时，最多 **4 个未提交的请求 FIFO 等待**，默认等 **180 秒**；`ACCOUNT_QUEUE_WAIT_MS` 可设为 0–180000，0 表示不等待。生成超时从获得执行位置后开始计时；客户端总超时应覆盖等待与生成，默认配置可达约 360 秒。队列没有持久化保证，进程中断不会自动重放。
+- 多账号池的新会话保留立即选择其他账号的逻辑，不先长时间占着第一个忙账号排队。外部请求不能通过传内部队列头改变配置。
+- 每账号每自然分钟 **6 次生成尝试**的保护仍保留，不伪装成无限额度。`account_rate_limit` 保留真实错误原因，`Retry-After` 指向下一分钟的剩余秒数；不是 Google 账号过期。
+- `account_queue_full`：4 个等待位置已经满；`account_queue_timeout`：达到等待上限。两者均未提交该请求到 Gemini。`account_busy` 是不等待的本地并发拒绝。网关不再把所有本地拒绝统一改成 `pool_busy`。
+- 断开连接的等待者会退出队列；SSE 的生成、写出与关闭都有生命周期上限，慢读/不读客户端不能永久占用账号。不会在上游任务尚未结束时强制释放锁并发执行下一条，也不会重放已提交的请求。
+- 管理端 `GET /admin/accounts/:id/status` 可查看 `busy`、`busy_since`、`queued`、`queue_capacity`、`queue_wait_ms` 和 `rate_limit`（limit/used/remaining/reset_at）。管理台“保活状态”也会显示处理中/空闲、队列和分钟用量。登录 healthy 不等于当前有空闲执行位置。
+
+用 `npm run smoke:concurrency` 做三种模式的并发验收：设置 `GATEWAY_URL`、`API_KEY`、`ADMIN_KEY`、`EXPECTED_ACCOUNT`，要求账号空闲且当前分钟至少剩 3 次；同时发送非流式、SSE、函数工具三条独立请求，检查真实队列、结果与队列释放。**会消耗 3 次真实生成，0 次重试**；不执行外部工具。不要把管理密钥交给普通客户端。

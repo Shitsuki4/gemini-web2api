@@ -432,6 +432,7 @@ async function apiRoute(request: Request, env: Env, path: string) {
       "no_available_account",
       "Import/enable an account or wait for its cooldown",
     );
+  let localFailure: Response | undefined;
   for (const account of accounts) {
     await env.DB.prepare("UPDATE accounts SET last_used=? WHERE id=?")
       .bind(now(), account.id)
@@ -445,6 +446,13 @@ async function apiRoute(request: Request, env: Env, path: string) {
           headers: {
             "Content-Type": "application/json",
             "x-public-origin": new URL(request.url).origin,
+            // Single-account and pinned traffic can wait without retrying a
+            // generation. Multi-account traffic retains immediate failover.
+            "x-queue-wait-ms": String(
+              accounts.length === 1
+                ? boundedInt(env.ACCOUNT_QUEUE_WAIT_MS, 180000, 0, 180000)
+                : 0,
+            ),
           },
           body: JSON.stringify(input),
           signal: request.signal,
@@ -458,10 +466,12 @@ async function apiRoute(request: Request, env: Env, path: string) {
           payload.error?.code,
         )
       ) {
-        await response.body?.cancel();
+        await localFailure?.body?.cancel();
+        localFailure = response;
         continue;
       }
     }
+    await localFailure?.body?.cancel();
     if (google && response.ok) {
       const result = (await response.json()) as any;
       return json(
@@ -484,6 +494,9 @@ async function apiRoute(request: Request, env: Env, path: string) {
     }
     return response;
   }
+  // Do not hide the actionable local rejection or its Retry-After behind
+  // the generic pool_busy label, particularly for a one-account deployment.
+  if (localFailure) return localFailure;
   throw new ApiError(429, "pool_busy", "All accounts are busy or rate limited");
 }
 export default {

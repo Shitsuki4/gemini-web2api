@@ -33,6 +33,8 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 MAX_ACCOUNTS = "5"
 MAX_REQUEST_BYTES = "1048576"
 REQUEST_TIMEOUT_MS = "180000"
+# Up to four waiting requests per account; 0 disables waiting.
+ACCOUNT_QUEUE_WAIT_MS = "180000"
 SESSION_TTL_SECONDS = "604800"
 # "auto" is normal placement; regional hints are best-effort, not an IP guarantee.
 ACCOUNT_LOCATION_HINT = "wnam"

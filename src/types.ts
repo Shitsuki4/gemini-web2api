@@ -9,6 +9,7 @@ export interface Env {
   MAX_ACCOUNTS?: string;
   MAX_REQUEST_BYTES?: string;
   REQUEST_TIMEOUT_MS?: string;
+  ACCOUNT_QUEUE_WAIT_MS?: string;
   SESSION_TTL_SECONDS?: string;
   ACCOUNT_LOCATION_HINT?: string;
   UPSTREAM_TRANSPORT?: string;
