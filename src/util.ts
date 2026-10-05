@@ -34,7 +34,9 @@ export function errorResponse(error: unknown) {
       },
     },
     e.status,
-    e.status === 429 ? { "Retry-After": String(e.retryAfter ?? 60) } : {},
+    e.status === 429 || e.retryAfter
+      ? { "Retry-After": String(e.retryAfter ?? 60) }
+      : {},
   );
 }
 export async function readLimited(response: Response | Request, max: number) {

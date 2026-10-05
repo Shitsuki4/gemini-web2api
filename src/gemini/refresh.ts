@@ -54,11 +54,13 @@ export function refreshDelay(
 }
 export function maintenanceMessage(s: LoginMaintenance) {
   const status =
-    s.status === "healthy"
-      ? "短期票据已换发，页面登录有效，SIDCC 已更新或尚未到维护时间。"
-      : s.status === "reimport_required"
-        ? "自动续期未恢复登录。请在浏览器确认登录后更新原账号；不会重放生成。"
-        : "本轮保活未全部通过；页面可用不等于长期票据已续期。";
+    s.status === "blocked"
+      ? "Google 拦截了页面访问；重新导入不一定有效。页面按退避检查，票据维护独立调度，不尝试绕过验证。"
+      : s.status === "healthy"
+        ? "最近的短票维护与页面检查已通过，SIDCC 已更新或尚未到维护时间；各步骤按独立周期检查。"
+        : s.status === "reimport_required"
+          ? "自动续期未恢复登录。请在浏览器确认登录后更新原账号；不会重放生成。"
+          : "本轮保活未全部通过；页面可用不等于长期票据已续期。";
   return `${status} 票据：${s.ticket?.code || s.ticket?.status || "待检查"}；SIDCC：${s.sidcc?.code || s.sidcc?.status || "待检查"}；页面：${s.page?.code || s.page?.status || "待检查"}。`;
 }
 interface RefreshClient {
@@ -117,15 +119,20 @@ export async function refreshLogin(
       `Login maintenance is in backoff; next attempt at ${new Date(old.nextAttemptAt * 1000).toISOString()}`,
       old.nextAttemptAt - time,
     );
+  // Separate budgets: a blocked page must neither starve a healthy ticket nor
+  // be retried every time that ticket is renewed. Legacy state keeps its floor.
+  const runRotation =
+    time >= (old?.nextRotationAt ?? old?.nextAttemptAt ?? time);
+  const runPage = time >= (old?.nextPageAt ?? old?.nextAttemptAt ?? time);
   const state: LoginMaintenance = {
     ...old,
     status: "running",
     lastAttemptAt: time,
     nextAttemptAt: time + 120,
     failures: old?.failures || 0,
-    ticket: undefined,
-    sidcc: undefined,
-    page: undefined,
+    ticket: runRotation ? undefined : old?.ticket,
+    sidcc: runRotation ? undefined : old?.sidcc,
+    page: runPage ? undefined : old?.page,
   };
   c.credentials.maintenance = state;
   // Persist before I/O so eviction / a deployment cannot erase the retry floor.
@@ -190,125 +197,166 @@ export async function refreshLogin(
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
   };
-  state.ticket = await step(async () => {
-    const cookie = subset(
-      c.credentials.cookie,
-      new Set(["__Secure-1PSID", "__Secure-1PSIDTS"]),
-    );
-    if (!/(?:^|;\s*)__Secure-1PSID=[^;]+/.test(cookie))
-      throw new ApiError(
-        502,
-        "refresh_unavailable",
-        "Import __Secure-1PSID to enable ticket renewal",
+  if (runRotation) {
+    state.ticket = await step(async () => {
+      const cookie = subset(
+        c.credentials.cookie,
+        new Set(["__Secure-1PSID", "__Secure-1PSIDTS"]),
       );
-    const r = await c.send(ROTATE_POST, {
-      method: "POST",
-      headers: { ...base, Cookie: cookie },
-      body: TICKET_BODY,
+      if (!/(?:^|;\s*)__Secure-1PSID=[^;]+/.test(cookie))
+        throw new ApiError(
+          502,
+          "refresh_unavailable",
+          "Import __Secure-1PSID to enable ticket renewal",
+        );
+      const r = await c.send(ROTATE_POST, {
+        method: "POST",
+        headers: { ...base, Cookie: cookie },
+        body: TICKET_BODY,
+      });
+      const names = await accept(r);
+      await r.body?.cancel();
+      if (!names.includes("__Secure-1PSIDTS"))
+        throw new ApiError(
+          502,
+          "refresh_no_ticket",
+          "Rotation did not issue a first-party short-lived ticket",
+        );
+      c.credentials.refreshedAt = now();
+      state.lastTicketAt = now();
+      await c.save();
+      return names;
     });
-    const names = await accept(r);
-    await r.body?.cancel();
-    if (!names.includes("__Secure-1PSIDTS"))
-      throw new ApiError(
-        502,
-        "refresh_no_ticket",
-        "Rotation did not issue a first-party short-lived ticket",
-      );
-    c.credentials.refreshedAt = now();
-    state.lastTicketAt = now();
+    // Persist a successful ticket even when the independent SIDCC/page step fails.
     await c.save();
-    return names;
-  });
-  // Persist a successful ticket even when the independent SIDCC/page step fails.
-  await c.save();
-  // Some accounts renew first-party SIDCC in the sentinel response too.
-  // A redundant POST immediately afterwards can itself trigger HTTP 429.
-  const issuedSidcc = (state.ticket.cookies || []).filter((n) =>
-    /^(?:SIDCC|__Secure-1PSIDCC)$/.test(n),
-  );
-  state.sidcc = issuedSidcc.length
-    ? { status: "ok", at: now(), cookies: issuedSidcc }
-    : rateLimited
-      ? { status: "skipped", at: now(), code: "refresh_rate_limited" }
-      : old?.lastSidccAt && now() < old.lastSidccAt + interval
-        ? { status: "skipped", at: now(), code: "refresh_not_due" }
-        : await step(async () => {
-            const r = await c.send(ROTATE_PAGE, {
-              headers: {
-                Cookie: subset(c.credentials.cookie, sharedNames),
-                Accept: "text/html",
-                Referer: "https://gemini.google.com/",
-                "Sec-Fetch-Dest": "iframe",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-site",
-              },
-            });
-            const names = await accept(r);
-            const params = rotateParams(
-              new TextDecoder().decode(await readLimited(r, 1024 * 1024)),
-            );
-            interval = params.interval;
-            const done = await c.send(ROTATE_POST, {
-              method: "POST",
-              headers: {
-                ...base,
-                Referer: ROTATE_PAGE,
-                Cookie: subset(c.credentials.cookie, sharedNames),
-              },
-              body: JSON.stringify([658, params.id]),
-            });
-            names.push(...(await accept(done)));
-            await done.body?.cancel();
-            if (!names.some((n) => /^(?:__Secure-[13]PSIDCC|SIDCC)$/.test(n)))
-              throw new ApiError(
-                502,
-                "refresh_no_sidcc",
-                "Rotation did not issue SIDCC cookies",
+    // Some accounts renew first-party SIDCC in the sentinel response too.
+    // A redundant POST immediately afterwards can itself trigger HTTP 429.
+    const issuedSidcc = (state.ticket.cookies || []).filter((n) =>
+      /^(?:SIDCC|__Secure-1PSIDCC)$/.test(n),
+    );
+    state.sidcc = issuedSidcc.length
+      ? { status: "ok", at: now(), cookies: issuedSidcc }
+      : rateLimited
+        ? { status: "skipped", at: now(), code: "refresh_rate_limited" }
+        : old?.lastSidccAt && now() < old.lastSidccAt + interval
+          ? { status: "skipped", at: now(), code: "refresh_not_due" }
+          : await step(async () => {
+              const r = await c.send(ROTATE_PAGE, {
+                headers: {
+                  Cookie: subset(c.credentials.cookie, sharedNames),
+                  Accept: "text/html",
+                  Referer: "https://gemini.google.com/",
+                  "Sec-Fetch-Dest": "iframe",
+                  "Sec-Fetch-Mode": "navigate",
+                  "Sec-Fetch-Site": "same-site",
+                },
+              });
+              const names = await accept(r);
+              const params = rotateParams(
+                new TextDecoder().decode(await readLimited(r, 1024 * 1024)),
               );
-            state.lastSidccAt = now();
-            return names;
-          });
-  if (state.sidcc.status === "ok") state.lastSidccAt = now();
-  await c.save();
-  // Crucially, a 401/429 in RotateCookies does not suppress this independent GET.
-  // It never submits a conversation or tries to solve an authentication challenge.
-  state.page = await step(async () => {
-    await c.tokens();
-    state.lastPageAt = now();
-    return [];
-  });
+              interval = params.interval;
+              const done = await c.send(ROTATE_POST, {
+                method: "POST",
+                headers: {
+                  ...base,
+                  Referer: ROTATE_PAGE,
+                  Cookie: subset(c.credentials.cookie, sharedNames),
+                },
+                body: JSON.stringify([658, params.id]),
+              });
+              names.push(...(await accept(done)));
+              await done.body?.cancel();
+              if (!names.some((n) => /^(?:__Secure-[13]PSIDCC|SIDCC)$/.test(n)))
+                throw new ApiError(
+                  502,
+                  "refresh_no_sidcc",
+                  "Rotation did not issue SIDCC cookies",
+                );
+              state.lastSidccAt = now();
+              return names;
+            });
+    if (state.sidcc.status === "ok") state.lastSidccAt = now();
+    await c.save();
+    // HTTP Retry-After on accounts.google.com applies to both rotation flows,
+    // not to the independent Gemini page. Page failure cannot postpone tickets.
+    state.rotationFailures =
+      state.ticket.status === "ok"
+        ? 0
+        : (old?.rotationFailures ?? old?.failures ?? 0) + 1;
+    state.nextRotationAt =
+      now() +
+      Math.max(
+        retryAfter,
+        refreshDelay(
+          state.rotationFailures,
+          [
+            "refresh_http_401",
+            "refresh_http_403",
+            "refresh_unavailable",
+          ].includes(state.ticket.code || ""),
+          retryAfter,
+          interval,
+        ),
+      );
+  }
+  if (runPage) {
+    retryAfter = 0;
+    // A 401/429 from accounts does not suppress this independently due GET.
+    state.page = await step(async () => {
+      await c.tokens();
+      state.lastPageAt = now();
+      return [];
+    });
+    state.pageFailures =
+      state.page.status === "ok"
+        ? 0
+        : (old?.pageFailures ?? old?.failures ?? 0) + 1;
+    state.nextPageAt =
+      now() +
+      Math.max(
+        retryAfter,
+        refreshDelay(
+          state.pageFailures,
+          state.page.code === "login_expired",
+          retryAfter,
+          REFRESH_INTERVAL,
+        ),
+      );
+    if (c.credentials.pageDiagnostic?.code)
+      c.credentials.pageDiagnostic.retryAt = state.nextPageAt;
+  }
   const good =
-    state.ticket.status === "ok" &&
-    (state.sidcc.status === "ok" || state.sidcc.code === "refresh_not_due") &&
-    state.page.status === "ok";
+    state.ticket?.status === "ok" &&
+    (state.sidcc?.status === "ok" || state.sidcc?.code === "refresh_not_due") &&
+    state.page?.status === "ok";
   const authFailure =
-    state.page.code === "login_expired" &&
+    state.page?.code === "login_expired" &&
     ["refresh_http_401", "refresh_http_403", "refresh_unavailable"].includes(
-      state.ticket.code || "",
+      state.ticket?.code || "",
     );
   state.status = good
     ? "healthy"
-    : authFailure
-      ? "reimport_required"
-      : "degraded";
+    : state.page?.code === "egress_blocked"
+      ? "blocked"
+      : authFailure
+        ? "reimport_required"
+        : "degraded";
   state.failures = good ? 0 : state.failures + 1;
   state.lastCompletedAt = now();
   state.intervalSeconds = interval;
-  state.nextAttemptAt =
-    now() +
-    Math.max(
-      retryAfter,
-      refreshDelay(
-        // A SIDCC-only failure must not exponentially postpone a healthy short
-        // ticket past its lifetime. Explicit Retry-After still takes priority.
-        state.ticket.status === "ok" && state.page.status === "ok"
-          ? 0
-          : state.failures,
-        authFailure,
-        retryAfter,
-        interval,
-      ),
-    );
+  state.nextAttemptAt = Math.min(state.nextRotationAt!, state.nextPageAt!);
+  state.history = [
+    ...(old?.history || []),
+    {
+      at: now(),
+      ticket: state.ticket?.code || state.ticket?.status || "unknown",
+      sidcc: state.sidcc?.code || state.sidcc?.status || "unknown",
+      page: state.page?.code || state.page?.status || "unknown",
+      ticketAt: state.ticket?.at,
+      pageAt: state.page?.at,
+    },
+  ].slice(-24);
   await c.save();
   return state;
 }

@@ -16,6 +16,8 @@ import {
   upstreamFailure,
 } from "./protocol";
 import { refreshLogin, retrySeconds } from "./refresh";
+import { inspectPage, pageFailure } from "./page";
+export { pageTokens } from "./page";
 export const ORIGIN = "https://gemini.google.com";
 export function parseCookies(cookie: string) {
   const out = new Map<string, string>();
@@ -63,25 +65,6 @@ export function mergeCookies(cookie: string, headers: string[]) {
   }
   return [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
 }
-export function pageTokens(html: string) {
-  const value = (key: string) => {
-    const m = html.match(
-      new RegExp('"' + key + '"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*")'),
-    );
-    try {
-      return m ? JSON.parse(m[1]) : "";
-    } catch {
-      return "";
-    }
-  };
-  return {
-    xsrf: value("SNlM0e"),
-    bl: value("cfb2h"),
-    pushId: value("qKIAYe"),
-    pctx: value("Ylro7b"),
-    fetchedAt: now(),
-  };
-}
 // Never include a redirect query (it can carry authentication data) in errors.
 export function redirectFailure(response: Response, from: string): ApiError {
   let target: URL;
@@ -104,11 +87,13 @@ export function redirectFailure(response: Response, from: string): ApiError {
       "egress_blocked",
       "Google redirected Cloudflare egress to its /sorry challenge. No challenge bypass is attempted.",
     );
+  if (target.hostname === "consent.google.com")
+    return pageFailure("consent_required");
   if (target.hostname === "accounts.google.com")
     return new ApiError(
       502,
       "login_expired",
-      "Google redirected to account login. The imported session may be expired or device-bound.",
+      "Google redirected to account login. Check the browser login before updating this account; this does not establish device binding.",
     );
   return new ApiError(
     502,
@@ -165,34 +150,64 @@ export class GeminiClient {
       this.credentials.fetchedAt = 0;
       await this.save();
     }
-    const r = await this.send(ORIGIN + "/" + surface, {
-      headers: { Accept: "text/html" },
-    });
-    if (r.status >= 300 && r.status < 400) {
-      await r.body?.cancel();
-      throw new ApiError(
-        502,
-        "login_expired",
-        "Gemini redirected to login. Re-import a valid session.",
+    const previous = this.credentials.pageDiagnostic;
+    // User retries must not bypass the persisted page cooldown. Forced probes
+    // are used only by independently due maintenance / explicit HTTP-400 repair.
+    if (
+      !force &&
+      previous?.code &&
+      previous.surface === surface &&
+      now() < (previous.retryAt || 0)
+    )
+      throw pageFailure(
+        previous.code,
+        previous.retryAt! - now(),
+        previous.errorStatus,
       );
-    }
-    if (!r.ok) {
-      await r.body?.cancel();
-      const error = upstreamFailure(r.status);
-      error.retryAfter = retrySeconds(r.headers.get("retry-after"));
-      throw error;
-    }
-    const tokens = pageTokens(
-      new TextDecoder().decode(await readLimited(r, 8 * 1024 * 1024)),
-    );
-    if (!tokens.xsrf || !tokens.bl)
-      throw new ApiError(
-        502,
-        "login_expired",
-        "Gemini did not return signed-in page tokens. Re-import the login; device-bound cookies may not be portable.",
+    let diagnostic: Credentials["pageDiagnostic"] = {
+      at: now(),
+      surface,
+      kind: "error",
+    };
+    try {
+      const r = await this.send(ORIGIN + "/" + surface, {
+        headers: { Accept: "text/html" },
+      });
+      diagnostic.httpStatus = r.status;
+      if (!r.ok) {
+        await r.body?.cancel();
+        const error = upstreamFailure(r.status);
+        error.retryAfter = retrySeconds(r.headers.get("retry-after"));
+        throw error;
+      }
+      const body = await readLimited(r, 8 * 1024 * 1024);
+      const checked = inspectPage(
+        new TextDecoder().decode(body),
+        surface,
+        r.status,
+        body.byteLength,
       );
-    Object.assign(this.credentials, tokens, { tokenSurface: surface });
-    await this.save();
+      diagnostic = checked.diagnostic;
+      if (diagnostic.code) throw pageFailure(diagnostic.code);
+      Object.assign(this.credentials, checked.tokens, {
+        tokenSurface: surface,
+        pageDiagnostic: diagnostic,
+      });
+      await this.save();
+    } catch (e) {
+      const code = e instanceof ApiError ? e.code : "page_network_error";
+      diagnostic.code = code;
+      diagnostic.errorStatus = e instanceof ApiError ? e.status : 502;
+      if (code === "egress_blocked") diagnostic.kind = "challenge";
+      else if (code === "login_expired") diagnostic.kind = "signed_out";
+      else if (code === "consent_required") diagnostic.kind = "consent";
+      diagnostic.retryAt =
+        now() + Math.max(600, e instanceof ApiError ? e.retryAfter || 0 : 0);
+      this.credentials.pageDiagnostic = diagnostic;
+      if (e instanceof ApiError) e.retryAfter = diagnostic.retryAt - now();
+      await this.save();
+      throw e;
+    }
   }
   async headers() {
     const h = new Headers({

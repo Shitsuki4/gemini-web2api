@@ -28,12 +28,24 @@ export interface RefreshStep {
   cookies?: string[];
 }
 export interface LoginMaintenance {
-  status: "running" | "healthy" | "degraded" | "reimport_required";
+  status: "running" | "healthy" | "degraded" | "reimport_required" | "blocked";
   lastAttemptAt: number;
   lastCompletedAt?: number;
   nextAttemptAt: number;
   failures: number;
   intervalSeconds?: number;
+  nextRotationAt?: number;
+  nextPageAt?: number;
+  rotationFailures?: number;
+  pageFailures?: number;
+  history?: {
+    at: number;
+    ticket: string;
+    sidcc: string;
+    page: string;
+    ticketAt?: number;
+    pageAt?: number;
+  }[];
   lastTicketAt?: number;
   lastSidccAt?: number;
   lastPageAt?: number;
@@ -41,7 +53,27 @@ export interface LoginMaintenance {
   sidcc?: RefreshStep;
   page?: RefreshStep;
 }
+export interface PageDiagnostic {
+  at: number;
+  surface: "app" | "spark";
+  httpStatus?: number;
+  bytes?: number;
+  hasXsrf?: boolean;
+  hasBuild?: boolean;
+  accountMarker?: "present" | "empty" | "absent";
+  kind:
+    | "signed_in"
+    | "signed_out"
+    | "challenge"
+    | "consent"
+    | "unrecognized"
+    | "error";
+  code?: string;
+  retryAt?: number;
+  errorStatus?: number;
+}
 export interface Credentials {
+  pageDiagnostic?: PageDiagnostic;
   importedAt?: number;
   maintenance?: LoginMaintenance;
   cookie: string;

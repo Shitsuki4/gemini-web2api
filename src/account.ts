@@ -213,6 +213,7 @@ export class GeminiAccount implements DurableObject {
           imported_at: this.creds?.importedAt || 0,
           maintenance: this.creds?.maintenance || null,
           tokens_at: this.creds?.fetchedAt || 0,
+          page_diagnostic: this.creds?.pageDiagnostic || null,
           refreshed_at: this.creds?.refreshedAt || 0,
           cookie_names:
             this.creds?.cookie.split(";").map((x) => x.trim().split("=")[0]) ||
@@ -246,7 +247,9 @@ export class GeminiAccount implements DurableObject {
             const maintenance = await this.maintain();
             return json({
               ok: maintenance.status === "healthy",
-              renewed: maintenance.ticket?.status === "ok",
+              renewed:
+                maintenance.ticket?.status === "ok" &&
+                maintenance.ticket.at >= maintenance.lastAttemptAt,
               refreshed_at: this.creds!.refreshedAt || 0,
               maintenance,
               message: maintenanceMessage(maintenance),

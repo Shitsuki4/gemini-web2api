@@ -1,4 +1,5 @@
 import { artifactGallery } from "./media.js";
+import { loginStatus } from "./login-status.js";
 const gallery = artifactGallery(document.getElementById("artifacts"));
 const $ = (id) => document.getElementById(id);
 let adminKey = "",
@@ -96,12 +97,10 @@ async function load() {
               }),
               button("保活状态", async () => {
                 const r = await api(`accounts/${a.id}/status`);
-                const m = r.maintenance;
                 notify(
-                  m
-                    ? `保活：${m.status}；票据：${m.ticket?.code || m.ticket?.status || "待检查"}；SIDCC：${m.sidcc?.code || m.sidcc?.status || "待检查"}；页面：${m.page?.code || m.page?.status || "待检查"}；下次检查：${new Date(m.nextAttemptAt * 1000).toLocaleString()}`
-                    : "尚未进行保活检查",
-                  !!m && m.status !== "healthy",
+                  loginStatus(r),
+                  !!r.page_diagnostic?.code ||
+                    (!!r.maintenance && r.maintenance.status !== "healthy"),
                 );
               }),
               button(a.enabled ? "暂停" : "启用", async () => {

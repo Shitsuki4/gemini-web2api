@@ -19,6 +19,8 @@ function setup(
     noSidcc?: boolean;
     cookies?: string[];
     retry?: string;
+    pageRetry?: string;
+    challenge?: boolean;
     firstPageFails?: boolean;
     interval?: number;
   } = {},
@@ -66,6 +68,13 @@ function setup(
       );
     if (url.endsWith("/app")) {
       pages++;
+      if (options.challenge)
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: "https://www.google.com/sorry/index?secret=PRIVATE",
+          },
+        });
       if (options.page === 302 || (options.firstPageFails && pages === 1))
         return new Response(null, {
           status: 302,
@@ -76,7 +85,7 @@ function setup(
       if (options.page && options.page !== 200)
         return new Response("error", {
           status: options.page,
-          headers: { "retry-after": options.retry || "0" },
+          headers: { "retry-after": options.pageRetry || "0" },
         });
       return new Response('"SNlM0e":"PRIVATE_XSRF","cfb2h":"boq_test"');
     }
@@ -151,14 +160,18 @@ describe("durable login maintenance", () => {
     expect(x.requests).toHaveLength(2);
     expect(r.sidcc?.status).toBe("skipped");
     expect(r.page?.status).toBe("ok");
-    expect(r.nextAttemptAt).toBe(time + 7200);
+    expect(r.nextRotationAt).toBe(time + 7200);
+    expect(r.nextPageAt).toBe(time + 600);
+    expect(r.nextAttemptAt).toBe(time + 600);
   });
   it("honors page probe Retry-After independently of successful ticket renewal", async () => {
-    const x = setup({ page: 429, retry: "7200" });
+    const x = setup({ page: 429, pageRetry: "7200" });
     const r = await x.client.rotate();
     expect(r.ticket?.status).toBe("ok");
     expect(r.page?.status).toBe("error");
-    expect(r.nextAttemptAt).toBe(time + 7200);
+    expect(r.nextRotationAt).toBe(time + 600);
+    expect(r.nextPageAt).toBe(time + 7200);
+    expect(r.nextAttemptAt).toBe(time + 600);
   });
   it("enforces persisted backoff even after client reconstruction", async () => {
     const x = setup({ ticket: 401, page: 302 });
@@ -183,7 +196,12 @@ describe("durable login maintenance", () => {
     expect(r.failures).toBe(2);
     expect(r.nextAttemptAt).toBe(time + 1800 + 3600);
     const y = setup();
-    y.creds.maintenance = { ...r, nextAttemptAt: time };
+    y.creds.maintenance = {
+      ...r,
+      nextAttemptAt: time,
+      nextRotationAt: time,
+      nextPageAt: time,
+    };
     expect((await y.client.rotate()).failures).toBe(0);
   });
   it.each(["Max-Age=0", "Max-Age=-1", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])(
@@ -339,5 +357,75 @@ describe("rotation and cookie parsers", () => {
     expect(retrySeconds("garbage")).toBe(0);
     expect(retrySeconds("9999999")).toBe(86400);
     expect(refreshDelay(20, true, 0, 600)).toBe(21600);
+  });
+});
+
+describe("independent page and rotation clocks", () => {
+  it("sustains short tickets for four simulated hours while backing off a blocked page", async () => {
+    const x = setup({
+      challenge: true,
+      cookies: [
+        "__Secure-1PSIDTS=NEW_TS; Domain=.google.com; Path=/",
+        "__Secure-1PSIDCC=NEW_CC; Domain=.google.com; Path=/",
+      ],
+    });
+    for (let i = 0; i < 25; i++) {
+      vi.spyOn(Date, "now").mockReturnValue((time + i * 600) * 1000);
+      // Reconstruct every round like DO eviction: all budgets must be persisted.
+      const c = new GeminiClient(
+        x.creds,
+        x.save,
+        AbortSignal.timeout(10000),
+        x.transport,
+      );
+      const state = await c.rotate();
+      expect(state.status).toBe("blocked");
+      expect(state.nextRotationAt).toBe(time + (i + 1) * 600);
+      expect(state.lastTicketAt).toBe(time + i * 600);
+      expect(state.rotationFailures).toBe(0);
+      expect(state.history!.length).toBeLessThanOrEqual(24);
+    }
+    expect(x.requests.filter((r) => r.body === TICKET_BODY)).toHaveLength(25);
+    expect(x.requests.filter((r) => r.url.endsWith("/app"))).toHaveLength(5);
+    expect(x.creds.maintenance?.nextPageAt).toBe(time + 31 * 600);
+    expect(JSON.stringify(x.creds.maintenance)).not.toMatch(
+      /PRIVATE|SECRET|NEW_TS|google.com/,
+    );
+  });
+  it("continues due page checks without violating accounts Retry-After", async () => {
+    const x = setup({ ticket: 429, retry: "7200" });
+    await x.client.rotate();
+    vi.spyOn(Date, "now").mockReturnValue((time + 600) * 1000);
+    const state = await x.client.rotate();
+    expect(x.requests.filter((r) => r.body === TICKET_BODY)).toHaveLength(1);
+    expect(x.requests.filter((r) => r.url.endsWith("/app"))).toHaveLength(2);
+    expect(state.nextRotationAt).toBe(time + 7200);
+    expect(state.nextPageAt).toBe(time + 1200);
+  });
+  it("does not retry a rate-limited page on every successful ticket renewal", async () => {
+    const x = setup({ page: 429, pageRetry: "7200" });
+    await x.client.rotate();
+    for (let i = 1; i <= 3; i++) {
+      vi.spyOn(Date, "now").mockReturnValue((time + i * 600) * 1000);
+      await x.client.rotate();
+    }
+    expect(x.requests.filter((r) => r.body === TICKET_BODY)).toHaveLength(4);
+    expect(x.requests.filter((r) => r.url.endsWith("/app"))).toHaveLength(1);
+    expect(x.creds.maintenance?.nextPageAt).toBe(time + 7200);
+  });
+  it("recovers after the independently due page succeeds", async () => {
+    const options = { challenge: true };
+    const x = setup(options);
+    await x.client.rotate();
+    vi.spyOn(Date, "now").mockReturnValue((time + 600) * 1000);
+    await x.client.rotate();
+    options.challenge = false;
+    vi.spyOn(Date, "now").mockReturnValue((time + 1200) * 1000);
+    expect((await x.client.rotate()).status).toBe("blocked");
+    vi.spyOn(Date, "now").mockReturnValue((time + 1800) * 1000);
+    const state = await x.client.rotate();
+    expect(state.status).toBe("healthy");
+    expect(state.pageFailures).toBe(0);
+    expect(x.creds.pageDiagnostic?.code).toBeUndefined();
   });
 });
