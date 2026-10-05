@@ -15,6 +15,49 @@ let rejectUpstream = false;
 let returnMedia = false;
 let returnTool = false;
 let upstreamGate: Promise<void> | undefined;
+let upstreamStarted: (() => Promise<void>) | undefined;
+// Synchronize on actual mock-upstream entry, not runner scheduling speed.
+function holdUpstream(startDelay = 0) {
+  let release!: () => void;
+  upstreamGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  upstreamStarted = async () => {
+    if (startDelay)
+      await new Promise((resolve) => setTimeout(resolve, startDelay));
+    entered();
+  };
+  return {
+    async waitUntilStarted() {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          started,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () =>
+                reject(
+                  new Error("Mock upstream did not start within 5 seconds"),
+                ),
+              5000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    release() {
+      upstreamStarted = undefined;
+      upstreamGate = undefined;
+      release();
+    },
+  };
+}
 const admin = "admin_" + "a".repeat(48),
   apiKey = "sk-" + "b".repeat(48);
 const headers = (key = apiKey) => ({
@@ -99,8 +142,11 @@ beforeAll(async () => {
           '"SNlM0e":"xsrf_test","cfb2h":"boq_test","qKIAYe":"push_test","Ylro7b":"pctx_test"',
         );
       if (url.pathname.includes("StreamGenerate")) {
+        // Capture the owner gate before the test releases it.
+        const gate = upstreamGate;
+        if (upstreamStarted) await upstreamStarted();
         calls++;
-        if (upstreamGate) await upstreamGate;
+        if (gate) await gate;
         if (rejectUpstream) return new Response("blocked", { status: 429 });
         const b = new URLSearchParams(await request.text());
         lastPayload = JSON.parse(JSON.parse(b.get("f.req")!)[1]);
@@ -533,17 +579,13 @@ describe("state lifecycle in workerd", () => {
 describe("concurrency and ambiguous jobs", () => {
   it("does not partially disable an account while a generation is in flight", async () => {
     const { id, db } = await freshAccount();
-    let release!: () => void;
-    upstreamGate = new Promise<void>((r) => {
-      release = r;
-    });
+    const held = holdUpstream();
     const before = calls;
     const pending = req("/v1/chat/completions", {
       messages: [{ role: "user", content: "slow" }],
     });
     try {
-      for (let i = 0; i < 100 && calls === before; i++)
-        await new Promise((r) => setTimeout(r, 10));
+      await held.waitUntilStarted();
       expect(calls).toBe(before + 1);
       const disabled = await req(
         "/admin/accounts/" + id,
@@ -569,8 +611,7 @@ describe("concurrency and ambiguous jobs", () => {
       );
       expect(calls).toBe(before + 1);
     } finally {
-      upstreamGate = undefined;
-      release();
+      held.release();
       await (await pending).text();
     }
   });
@@ -982,14 +1023,16 @@ describe("OpenAI client session compatibility in workerd", () => {
 });
 
 describe("bounded pre-submission scheduling", () => {
-  it.each([false, true])(
-    "queues rather than submitting concurrently (stream=%s)",
-    async (stream) => {
+  it.each([
+    { stream: false, startDelay: 0 },
+    { stream: true, startDelay: 0 },
+    { stream: false, startDelay: 750 },
+    { stream: true, startDelay: 750 },
+  ])(
+    "queues rather than submitting concurrently (stream=$stream, startup=$startDelay ms)",
+    async ({ stream, startDelay }) => {
       const { id } = await freshAccount();
-      let release!: () => void;
-      upstreamGate = new Promise<void>((r) => {
-        release = r;
-      });
+      const held = holdUpstream(startDelay);
       const before = calls;
       const first = req("/v1/chat/completions", {
         messages: [{ role: "user", content: "FIRST_QUEUED_TEST" }],
@@ -999,8 +1042,7 @@ describe("bounded pre-submission scheduling", () => {
       });
       let second: Promise<any> | undefined;
       try {
-        for (let i = 0; i < 100 && calls === before; i++)
-          await new Promise((r) => setTimeout(r, 5));
+        await held.waitUntilStarted();
         expect(calls).toBe(before + 1);
         second = req("/v1/chat/completions", {
           stream,
@@ -1022,8 +1064,7 @@ describe("bounded pre-submission scheduling", () => {
         expect(status.busy_since).toBeGreaterThan(0);
         expect(status.rate_limit.used).toBe(1);
         expect(calls).toBe(before + 1);
-        upstreamGate = undefined;
-        release();
+        held.release();
         await first;
         const text = await second;
         if (stream) expect(text).toContain("data: [DONE]");
@@ -1035,8 +1076,7 @@ describe("bounded pre-submission scheduling", () => {
         expect(status.busy).toBe(false);
         expect(status.rate_limit.used).toBe(2);
       } finally {
-        upstreamGate = undefined;
-        release();
+        held.release();
         await first;
         await second;
       }
