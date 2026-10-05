@@ -130,3 +130,11 @@ npm run watch:login -- --account acc_你的账号ID --minutes 35 --verify-chat
 观察脚本只对本机到网关的状态 GET 连接错误做最多 3 次有界重试，并输出 `status_read_retry`；HTTP 错误不重试。不会重试最终生成，更不会调用刷新/导入来造出通过结果。输出中的 `status_read_retries` 用于审计本机网络中断。
 
 如果反复在短时间后失效，Go 参考 README 还提示同一个浏览器继续轮换可能影响导出的会话，并建议使用独立的 Firefox 登录会话。可人工建立专供网关的会话、确认登录后更新原账号；不要持续在浏览器和网关两端同时使用同一复制会话。**这是后续排查建议，不是本账号已确认的根因，也不是 Firefox 能解决 Google 出口拦截或保证永久登录的承诺。** 本项目不会自动关闭用户的 Roxy/Chrome 或获取设备私钥。
+
+## OpenAI 客户端报 `invalid_id`
+
+旧网关会把客户端自定义的 `session_id` / `X-Session-Id`（如 UUID）误当作资源定位符，在请求 Google 前返回 `400 Invalid resource identifier`。新版本将普通客户端标识与网关续聊 ID 分开。第三方客户端发送完整历史即可；只有需要远程增量续聊时才设置 `gemini_session_id` / `X-Gemini-Session-Id`，值必须来自网关响应头。详见 [API 会话语义](api.md#客户端会话标识与-gemini-续聊)。
+
+可用 `npm run smoke:openai` 做一次有界验收：**7 次真实生成**，覆盖自定义 ID 下的非流式、SSE、两种工具调用格式及模拟工具结果回传，还有不重放历史的远程续聊。脚本检查 `finish_reason: tool_calls`、工具名、JSON 字符串参数及 SSE `[DONE]`，并非只看 HTTP 200。工具本身不执行、不查询天气；回传结果是本机生成的测试数据。请求开始间隔至少 12 秒，不重试；建议在原账号一分钟没有其他生成时单独运行，任一失败立即停止。环境变量与 `smoke` 相同，额外可设置 `EXPECTED_ACCOUNT` 来断言始终使用原账号。
+
+`invalid_session_id` 表示明确的网关 ID 格式或字段类型有问题；`conflicting_session_ids` 表示几个字段指定了不同的真实网关会话。不要通过重新导入 Cookie 处理这类本地参数错误。文件/视频资源 ID 仍严格校验，不能用客户端会话 UUID 下载资源。

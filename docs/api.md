@@ -6,7 +6,7 @@
 
 - Base URL 使用 `https://<你的网关>/v1`；API Key 通过 `Authorization` 或 `X-API-Key` 请求头发送，不放入 URL。
 - 跨域调用使用 `credentials: "omit"`（或默认的 `same-origin`），不要设置 `include`。仅预检无需鉴权，真正的模型、生成和文件请求都需要有效 API Key。
-- `/v1/` 和 `/v1beta/` 支持 `GET, POST, OPTIONS` 预检及浏览器 SDK 自定义请求头；前提是字段名合法且总长度/数量受限。成功和错误响应均带 CORS；可读取 `X-Session-Id`、`Retry-After` 和下载元数据。不要把 ADMIN_KEY 填入第三方客户端，也不要把推理 API Key 交给不可信网页。
+- `/v1/` 和 `/v1beta/` 支持 `GET, POST, OPTIONS` 预检及浏览器 SDK 自定义请求头；前提是字段名合法且总长度/数量受限。成功和错误响应均带 CORS；可读取 `X-Gemini-Session-Id`、`X-Session-Id`、`Retry-After` 和下载元数据。不要把 ADMIN_KEY 填入第三方客户端，也不要把推理 API Key 交给不可信网页。
 - `Failed to fetch` 是浏览器无法获得可读响应，不足以证明 Gemini 登录失效；常见原因包括网络、错误地址、浏览器跨域策略或代理断流。用开发者工具检查 OPTIONS/POST 的状态，与管理台“请求记录”对照；记录缺失不单独证明请求从未到达服务器。
 - 自带管理台区分读取、写入、生成和下载的连接失败，不自动重发操作。生成 POST 失败可能已经消耗上游额度；先查记录再决定下一步。不要关闭浏览器安全检查或使用 `no-cors`（只会得到不可读响应）。
 
@@ -37,13 +37,23 @@
 }
 ```
 
-响应头 `X-Session-Id` 形如 `acc_…​.s_…`。续聊通过请求头 `X-Session-Id` 或 JSON `session_id` 传回**完整原值**，只附一条新增 user/tool 消息，不要重发完整历史。不带 ID 则新建会话，没有隐式归组。会话不能切换模型，也不能跨 API Key 访问。失败/断流可能已消耗上游额度；没有幂等生成保证，不应盲目重试。
+### 客户端会话标识与 Gemini 续聊
+
+普通 OpenAI 客户端直接发送完整 `messages` 历史即可，无需设置网关续聊参数。
+
+- 响应头 `X-Gemini-Session-Id` 形如 `acc_<32hex>.s_<32hex>`，兼容响应头 `X-Session-Id` 返回相同值；跨域浏览器可读取两个头。
+- **网关远程续聊**：通过 JSON `gemini_session_id` 或请求头 `X-Gemini-Session-Id` 传回完整原值，并且只发送一条新增 user/tool 消息，不能重发完整历史。会话不能切换模型或跨 API Key 访问；不存在或过期的会话仍报错，不会悄悄新建。
+- **旧版兼容**：`session_id` / `X-Session-Id` 中的合法网关 ID 仍然按上述续聊处理。
+- **客户端自定义 ID**：旧字段里的普通 UUID、追踪或会话字符串仅作为不参与路由的客户端标识忽略；必须发送完整历史。相同客户端 ID 不会自动恢复 Gemini 上下文，也不会做账号绑定或去重。旧字段 `null`/空串视为未设置。
+- 显式 `gemini_session_id` / `X-Gemini-Session-Id` 只接受完整网关 ID。截断的 `acc_…`/`s_…`、非法类型、控制字符或超过 512 字符的标识返回 `400 invalid_session_id`；多个网关 ID 不一致返回 `400 conflicting_session_ids`，不按字段优先级猜测。
+
+不带网关 ID 则新建会话，没有隐式归组。失败/断流可能已消耗上游额度；没有幂等生成保证，不应盲目重试。
 
 Chat SSE 为 `data: {...}`，正常完成发送 `data: [DONE]`。流建立后的错误用 `event: error` 表示，HTTP 200 不代表最终成功。Responses SSE 使用 `response.created`、增量/结束事件和 `response.completed`；失败发送 `response.failed`。工具输出及媒体输出可能缓冲后再发送，不承诺实时逐字。
 
 ## Spark Beta（实验性文本适配）
 
-请求 `"model": "gemini-spark"`，使用同样的 Chat/Responses 接口和 `X-Session-Id` 续聊。它是网页 Spark 任务模式（tool 40），不是给普通 Flash 换名；需要账号本身能使用 Spark。模型清单不代表账号权益或上游健康。
+请求 `"model": "gemini-spark"`，使用同样的 Chat/Responses 接口和 `X-Gemini-Session-Id` 续聊。它是网页 Spark 任务模式（tool 40），不是给普通 Flash 换名；需要账号本身能使用 Spark。模型清单不代表账号权益或上游健康。
 
 ```json
 {
@@ -75,7 +85,7 @@ Chat SSE 为 `data: {...}`，正常完成发送 `data: [DONE]`。流建立后的
 }
 ```
 
-支持基础 message、`function_call`、`function_call_output` 输入，及 `instructions`。不支持 `previous_response_id`、后台 Responses、服务端 response 查询/取消、完整 OpenAI SDK 参数集或 Codex CLI 全功能兼容承诺。续聊仍使用本项目 `session_id`。
+支持基础 message、`function_call`、`function_call_output` 输入，及 `instructions`。不支持 `previous_response_id`、后台 Responses、服务端 response 查询/取消、完整 OpenAI SDK 参数集或 Codex CLI 全功能兼容承诺。续聊使用本项目 `gemini_session_id`（兼容合法旧 `session_id`），不将 OpenAI response ID 作为会话 ID。
 
 ## 附件
 

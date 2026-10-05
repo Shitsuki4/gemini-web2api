@@ -9,7 +9,7 @@ export function apiCorsHeaders(): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers":
-      "X-Session-Id, Retry-After, Content-Disposition, Content-Length, Content-Range, Accept-Ranges",
+      "X-Gemini-Session-Id, X-Session-Id, Retry-After, Content-Disposition, Content-Length, Content-Range, Accept-Ranges",
   };
 }
 export function apiPreflight(request: Request): Response {
@@ -43,6 +43,7 @@ export function apiPreflight(request: Request): Response {
           "content-type",
           "x-api-key",
           "x-session-id",
+          "x-gemini-session-id",
           "range",
           ...requested,
         ]),

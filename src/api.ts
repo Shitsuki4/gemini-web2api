@@ -106,7 +106,7 @@ export function normalize(
     if (!Array.isArray(input)) return bad("input is required");
     if (body.previous_response_id)
       return bad(
-        "previous_response_id is not supported; use session_id and one new message",
+        "previous_response_id is not supported; use gemini_session_id and one new message",
       );
     messages = input.map((x: any) => {
       if (!x || typeof x !== "object" || Array.isArray(x))
@@ -139,7 +139,7 @@ export function normalize(
       1
   )
     return bad(
-      "A session_id accepts exactly one new user/tool message (delta mode), not full history",
+      "A gateway session ID accepts exactly one new user/tool message (delta mode), not full history",
     );
   if (
     session &&

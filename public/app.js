@@ -272,7 +272,7 @@ $("chat-form").onsubmit = async (e) => {
           model: $("model").value,
           messages: [{ role: "user", content: $("prompt").value }],
           stream: true,
-          ...(session ? { session_id: session } : {}),
+          ...(session ? { gemini_session_id: session } : {}),
         }),
         signal: controller.signal,
       },
@@ -282,7 +282,10 @@ $("chat-form").onsubmit = async (e) => {
       const err = await responseJson(r, "generate");
       throw Error(err.error?.message || `HTTP ${r.status}`);
     }
-    session = r.headers.get("x-session-id") || "";
+    session =
+      r.headers.get("x-gemini-session-id") ||
+      r.headers.get("x-session-id") ||
+      "";
     $("session-info").textContent = "会话：" + session;
     const reader = r.body.getReader(),
       decoder = new TextDecoder();

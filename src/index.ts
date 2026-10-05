@@ -13,6 +13,7 @@ import {
   uid,
 } from "./util";
 import { normalize } from "./api";
+import { resolveSession } from "./session";
 import { MODELS } from "./gemini/models";
 import { validateCookie } from "./gemini/client";
 export { GeminiAccount } from "./account";
@@ -297,6 +298,7 @@ async function apiRoute(request: Request, env: Env, path: string) {
     request,
     boundedInt(env.MAX_REQUEST_BYTES, 1048576, 4096, 1048576),
   );
+  const { account: pinned, session } = resolveSession(body, request.headers);
   if (google) {
     if (google[2] === "streamGenerateContent")
       throw new ApiError(
@@ -407,11 +409,6 @@ async function apiRoute(request: Request, env: Env, path: string) {
     )
       throw new ApiError(400, "invalid_model", "Use the matching media model");
   }
-  let pinned = "",
-    session = body.session_id || request.headers.get("x-session-id");
-  if (session) {
-    [pinned, session] = splitId(session, "s");
-  }
   const input = normalize(
     body,
     endpoint === "google" ? "chat" : endpoint,
@@ -511,6 +508,9 @@ export default {
       response = errorResponse(e);
     }
     const headers = new Headers(response.headers);
+    const gatewaySession = headers.get("X-Session-Id");
+    if (publicApi && gatewaySession)
+      headers.set("X-Gemini-Session-Id", gatewaySession);
     if (publicApi)
       for (const [name, value] of Object.entries(apiCorsHeaders()))
         headers.set(name, value);

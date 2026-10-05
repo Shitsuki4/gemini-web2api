@@ -13,6 +13,7 @@ let lastPrompt = "";
 let lastPayload: any[] = [];
 let rejectUpstream = false;
 let returnMedia = false;
+let returnTool = false;
 let upstreamGate: Promise<void> | undefined;
 const admin = "admin_" + "a".repeat(48),
   apiKey = "sk-" + "b".repeat(48);
@@ -123,6 +124,16 @@ beforeAll(async () => {
               event({ 46: ["c_runtime", ""] }),
           );
         }
+        if (returnTool)
+          return new Response(
+            wire(
+              JSON.stringify({
+                tool_calls: [
+                  { name: "get_weather", arguments: { city: "Shanghai" } },
+                ],
+              }),
+            ),
+          );
         return new Response(
           ")]}'\n42\n" + wire("Hello") + wire("Hello runtime"),
           { headers: { "content-type": "application/json" } },
@@ -176,6 +187,9 @@ describe("actual workerd + SQLite DO + D1 integration", () => {
       expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
       expect(r.headers.get("Access-Control-Allow-Headers")).toContain(
         "authorization",
+      );
+      expect(r.headers.get("Access-Control-Allow-Headers")).toContain(
+        "x-gemini-session-id",
       );
     }
     expect(calls).toBe(before);
@@ -737,5 +751,223 @@ describe("login maintenance alarm lifecycle", () => {
       await stub.fetch("https://test/test/alarm-at")
     ).json()) as any;
     expect(alarm.at).toBeGreaterThan(Date.now() + 86390000);
+  });
+});
+
+describe("OpenAI client session compatibility in workerd", () => {
+  const opaque = "6d3b06f5-70ad-4138-a1f4-79145cf7fbdd";
+  const history = [
+    { role: "user", content: "EARLIER_QUESTION" },
+    { role: "assistant", content: "EARLIER_ANSWER" },
+    { role: "user", content: "NEW_QUESTION" },
+  ];
+  async function chat(body: any, extra: Record<string, string> = {}) {
+    return mf.dispatchFetch("https://gateway.test/v1/chat/completions", {
+      method: "POST",
+      headers: { ...headers(), Origin: "https://client.test", ...extra },
+      body: JSON.stringify({ model: "gemini-3.6-flash", ...body }),
+    });
+  }
+  function sessionHeader(r: any) {
+    const id = r.headers.get("X-Gemini-Session-Id");
+    expect(id).toMatch(/^acc_[a-f0-9]{32}\.s_[a-f0-9]{32}$/);
+    expect(r.headers.get("X-Session-Id")).toBe(id);
+    expect(r.headers.get("Access-Control-Expose-Headers")).toContain(
+      "X-Gemini-Session-Id",
+    );
+    return id;
+  }
+  it.each([false, true])(
+    "accepts opaque body/header IDs with full history (stream=%s)",
+    async (stream) => {
+      await freshAccount();
+      const r = await chat(
+        { stream, session_id: opaque, messages: history },
+        { "X-Session-Id": "client-trace" },
+      );
+      expect(r.status).toBe(200);
+      const id = sessionHeader(r);
+      const text = await r.text();
+      if (stream) {
+        expect(text).toContain("data: [DONE]");
+        expect(text).not.toContain("event: error");
+      } else
+        expect(JSON.parse(text).choices[0].message.content).toBe(
+          "Hello runtime",
+        );
+      expect(lastPrompt).toContain("EARLIER_QUESTION");
+      expect(lastPrompt).toContain("NEW_QUESTION");
+      expect(lastPayload[2][0]).toBeFalsy();
+      // Reusing a client ID does not group accounts or resume a remote chat.
+      const next = await chat({ session_id: opaque, messages: history });
+      expect(next.status).toBe(200);
+      expect(sessionHeader(next)).not.toBe(id);
+      await next.text();
+      expect(lastPayload[2][0]).toBeFalsy();
+    },
+  );
+  it.each([false, true])(
+    "returns real OpenAI-shaped tool calls with opaque IDs (stream=%s)",
+    async (stream) => {
+      await freshAccount();
+      const tools = [
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            parameters: {
+              type: "object",
+              properties: { city: { type: "string" } },
+              required: ["city"],
+            },
+          },
+        },
+      ];
+      let call: any;
+      returnTool = true;
+      try {
+        const r = await chat(
+          {
+            stream,
+            session_id: opaque,
+            messages: history,
+            tools,
+            tool_choice: "required",
+          },
+          { "X-Session-Id": "trace" },
+        );
+        expect(r.status).toBe(200);
+        sessionHeader(r);
+        if (stream) {
+          const text = await r.text();
+          expect(text).toContain("data: [DONE]");
+          expect(text).not.toContain("event: error");
+          const chunks = text
+            .split("\n")
+            .filter((line) => line.startsWith("data: {"))
+            .map((line) => JSON.parse(line.slice(6)));
+          expect(
+            chunks.some((c) => c.choices[0].finish_reason === "tool_calls"),
+          ).toBe(true);
+          call = chunks.flatMap((c) => c.choices[0].delta.tool_calls || [])[0];
+        } else {
+          const b: any = await r.json();
+          expect(b.choices[0].finish_reason).toBe("tool_calls");
+          expect(b.choices[0].message.content).toBeNull();
+          call = b.choices[0].message.tool_calls[0];
+        }
+        expect(call.id).toMatch(/^call_/);
+        expect(call.type).toBe("function");
+        expect(call.function.name).toBe("get_weather");
+        expect(JSON.parse(call.function.arguments)).toEqual({
+          city: "Shanghai",
+        });
+      } finally {
+        returnTool = false;
+      }
+      const result = await chat({
+        session_id: opaque,
+        tools,
+        messages: [
+          ...history,
+          { role: "assistant", content: null, tool_calls: [call] },
+          { role: "tool", tool_call_id: call.id, content: "LOCAL_TOOL_RESULT" },
+        ],
+      });
+      expect(result.status).toBe(200);
+      await result.text();
+      expect(lastPrompt).toContain("LOCAL_TOOL_RESULT");
+      expect(lastPrompt).toContain("EARLIER_QUESTION");
+    },
+  );
+  it("strictly resumes canonical IDs and retains ownership/delta-mode guards", async () => {
+    await freshAccount();
+    const first = await chat({ messages: history });
+    const id = sessionHeader(first);
+    await first.text();
+    const wrongHistory = await chat({
+      gemini_session_id: id,
+      messages: history,
+    });
+    expect(wrongHistory.status).toBe(400);
+    const other: any = await (
+      await req("/admin/keys", { name: "canonical-owner-test" }, admin)
+    ).json();
+    const denied = await req(
+      "/v1/chat/completions",
+      {
+        gemini_session_id: id,
+        messages: [{ role: "user", content: "cannot access" }],
+      },
+      other.key,
+    );
+    expect(denied.status).toBe(404);
+    for (const viaHeader of [false, true]) {
+      const r = await chat(
+        {
+          messages: [{ role: "user", content: "DELTA_ONLY" }],
+          ...(viaHeader ? { session_id: opaque } : { gemini_session_id: id }),
+        },
+        viaHeader ? { "X-Gemini-Session-Id": id } : {},
+      );
+      expect(r.status).toBe(200);
+      expect(sessionHeader(r)).toBe(id);
+      await r.text();
+      expect(lastPrompt).not.toContain("EARLIER_QUESTION");
+      expect(lastPayload[2][0]).toBe("c_runtime");
+    }
+    const model = await chat({
+      model: "gemini-3.1-pro",
+      gemini_session_id: id,
+      messages: [{ role: "user", content: "different model" }],
+    });
+    expect(model.status).toBe(400);
+    expect(((await model.json()) as any).error.code).toBe("session_model");
+  });
+  it("rejects invalid/conflicting IDs before any upstream work, preserving resource validation", async () => {
+    const { id } = await freshAccount(),
+      before = calls;
+    for (const [body, extra, code] of [
+      [{ session_id: { id: opaque } }, {}, "invalid_session_id"],
+      [{ gemini_session_id: opaque }, {}, "invalid_session_id"],
+      [{ session_id: id + ".s_bad" }, {}, "invalid_session_id"],
+      [{}, { "X-Gemini-Session-Id": opaque }, "invalid_session_id"],
+      [
+        { gemini_session_id: id + ".s_" + "a".repeat(32) },
+        { "X-Session-Id": id + ".s_" + "b".repeat(32) },
+        "conflicting_session_ids",
+      ],
+    ] as [any, Record<string, string>, string][]) {
+      const r = await chat({ ...body, messages: history }, extra);
+      expect(r.status).toBe(400);
+      const b: any = await r.json();
+      expect(b.error.code).toBe(code);
+      expect(b.error.message).not.toContain(opaque);
+      expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    }
+    for (const path of ["/v1/files/bad/content", "/v1/videos/bad"]) {
+      const r = await req(path);
+      expect(r.status).toBe(400);
+      expect(((await r.json()) as any).error.code).toBe("invalid_id");
+    }
+    expect(calls).toBe(before);
+  });
+  it("does not drop explicit IDs when adapting Google or media bodies", async () => {
+    const { id } = await freshAccount(),
+      before = calls;
+    const gemini_session_id = id + ".s_" + "a".repeat(32);
+    for (const [path, body] of [
+      ["/v1/responses", { input: "test" }],
+      [
+        "/v1beta/models/gemini-3.6-flash:generateContent",
+        { contents: [{ role: "user", parts: [{ text: "test" }] }] },
+      ],
+      ["/v1/images/generations", { prompt: "test" }],
+    ] as const) {
+      const r = await req(path, { ...body, gemini_session_id });
+      expect(r.status).toBe(404);
+      expect(((await r.json()) as any).error.code).toBe("not_found");
+    }
+    expect(calls).toBe(before);
   });
 });
