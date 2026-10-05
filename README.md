@@ -134,3 +134,9 @@ npm run build
 ## 协议来源与许可
 
 协议字段参考 `gemini-web2api-go` 提交 `2158ea0bce6f5ae9cd7e8e9c04d4fd58b7986195`，保留其 MIT 声明，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。本项目与 Google、Cloudflare 均无官方关系；只用于自己拥有或获授权的账号，并遵守服务条款。使用网页非公开协议存在随时失效、账号受限和数据外发给 Google 的风险。
+
+### OpenAI 客户端会话兼容
+
+普通客户端可直接发送完整消息历史；自己的 `session_id` / `X-Session-Id`（如 UUID）不会再被误判为 Gemini 资源 ID。只有远程增量续聊才使用网关返回的 `gemini_session_id` / `X-Gemini-Session-Id`，并只发一条新消息。旧字段里的合法网关 ID 仍兼容，不能跨 API Key 使用。详见 [API 文档](docs/api.md)。
+
+`npm run smoke:openai` 验证非流式、SSE、真实续聊、两种函数工具调用及结果回传（7 次真实生成、无重试、工具结果为本机合成，不执行外部函数）。工具为提示词模拟，不是 Gemini 原生工具 API。最新 [验收记录](docs/verification.md) 包含失败记录和最终通过结果。
