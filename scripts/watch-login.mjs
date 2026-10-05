@@ -31,12 +31,28 @@ let imported,
   last;
 const emit = (data) =>
   console.log(JSON.stringify({ at: new Date().toISOString(), ...data }));
+let statusReadRetries = 0;
+async function readStatus() {
+  // Only the read-only status GET may retry a local connection failure. Never
+  // retry a failed generation, an HTTP error, refresh or cookie import here.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fetch(new URL(`/admin/accounts/${account}/status`, origin), {
+        headers: { Authorization: `Bearer ${process.env.ADMIN_KEY}` },
+        redirect: "error",
+        signal: AbortSignal.timeout(30000),
+      });
+    } catch {
+      if (attempt === 3)
+        throw Error("Status connection failed after three bounded attempts");
+      statusReadRetries++;
+      emit({ test: "status_read_retry", attempt, code: "connection_failed" });
+      await new Promise((r) => setTimeout(r, attempt * 2000));
+    }
+  }
+}
 async function status() {
-  const r = await fetch(new URL(`/admin/accounts/${account}/status`, origin), {
-    headers: { Authorization: `Bearer ${process.env.ADMIN_KEY}` },
-    redirect: "error",
-    signal: AbortSignal.timeout(30000),
-  });
+  const r = await readStatus();
   if (!r.ok) throw Error(`Status HTTP ${r.status}`);
   const s = await r.json();
   if (!s.enabled || !s.configured)
@@ -116,6 +132,7 @@ try {
     minutes: (Date.now() - start) / 60000,
     observed_renewals: tickets.size,
     without_reimport: true,
+    status_read_retries: statusReadRetries,
   });
 } catch (e) {
   emit({ test: "observation_failed", ok: false, message: e.message });

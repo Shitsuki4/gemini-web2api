@@ -9,10 +9,14 @@ async function run(
     verify?: boolean;
     wrongAccount?: boolean;
     minutes?: string;
+    connectionFailures?: number;
+    statusHttp?: number;
+    generationFailure?: boolean;
   } = {},
 ) {
   const start = 1791160000000;
   let time = start;
+  let connectionFailures = options.connectionFailures || 0;
   const output: any[] = [];
   const requests: string[] = [];
   const process = {
@@ -42,6 +46,9 @@ async function run(
     requests.push(url);
     expect(init.redirect).toBe("error");
     if (url.endsWith("/status")) {
+      if (connectionFailures-- > 0) throw Error("private network detail");
+      if (options.statusHttp)
+        return new Response(null, { status: options.statusHttp });
       const round =
         options.renew === false ? 0 : Math.floor((time - start) / 600000);
       const ticket = (start - 600000 + round * 600000) / 1000;
@@ -61,6 +68,7 @@ async function run(
       });
     }
     expect(url).toBe("https://gateway.test/v1/chat/completions");
+    if (options.generationFailure) throw Error("fetch failed");
     const text = JSON.parse(init.body).messages[0].content.split(": ")[1];
     return Response.json(
       { choices: [{ message: { content: text } }] },
@@ -130,6 +138,31 @@ describe("bounded, read-only login observation CLI", () => {
     const r = await run({ verify: true, wrongAccount: true });
     expect(r.process.exitCode).toBe(1);
     expect(r.output.at(-1).message).toContain("different account");
+  });
+  it("recovers a transient status-only network error without losing the observation clock", async () => {
+    const r = await run({ connectionFailures: 1 });
+    expect(r.process.exitCode).toBe(0);
+    expect(r.output.at(-1).status_read_retries).toBe(1);
+    expect(r.time - r.start).toBe(21 * 60000);
+    expect(r.requests.every((x) => x.endsWith("/status"))).toBe(true);
+    expect(JSON.stringify(r.output)).not.toContain("private network detail");
+  });
+  it("bounds failed connection attempts at three", async () => {
+    const r = await run({ connectionFailures: 10 });
+    expect(r.process.exitCode).toBe(1);
+    expect(r.requests).toHaveLength(3);
+  });
+  it("does not retry status HTTP errors", async () => {
+    const r = await run({ statusHttp: 401 });
+    expect(r.process.exitCode).toBe(1);
+    expect(r.requests).toHaveLength(1);
+  });
+  it("never retries a failed final generation", async () => {
+    const r = await run({ verify: true, generationFailure: true });
+    expect(r.process.exitCode).toBe(1);
+    expect(r.requests.filter((x) => x.endsWith("/completions"))).toHaveLength(
+      1,
+    );
   });
   it("rejects unbounded observation durations", async () => {
     await expect(run({ minutes: "9999" })).rejects.toThrow("Set GATEWAY_URL");
