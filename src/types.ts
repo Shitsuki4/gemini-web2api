@@ -1,0 +1,148 @@
+export interface Env {
+  DB: D1Database;
+  ACCOUNTS: DurableObjectNamespace;
+  ASSETS: Fetcher;
+  ADMIN_KEY: string;
+  API_KEY?: string;
+  ENCRYPTION_KEY: string;
+  DEFAULT_MODEL?: string;
+  MAX_ACCOUNTS?: string;
+  MAX_REQUEST_BYTES?: string;
+  REQUEST_TIMEOUT_MS?: string;
+  ACCOUNT_QUEUE_WAIT_MS?: string;
+  SESSION_TTL_SECONDS?: string;
+  ACCOUNT_LOCATION_HINT?: string;
+  UPSTREAM_TRANSPORT?: string;
+}
+export interface AccountRow {
+  id: string;
+  label: string;
+  enabled: number;
+  last_used: number;
+  health: string;
+  cooldown_until: number;
+}
+export interface RefreshStep {
+  status: "ok" | "error" | "skipped";
+  at: number;
+  code?: string;
+  cookies?: string[];
+}
+export interface LoginMaintenance {
+  status: "running" | "healthy" | "degraded" | "reimport_required" | "blocked";
+  lastAttemptAt: number;
+  lastCompletedAt?: number;
+  nextAttemptAt: number;
+  failures: number;
+  intervalSeconds?: number;
+  nextRotationAt?: number;
+  nextPageAt?: number;
+  rotationFailures?: number;
+  pageFailures?: number;
+  history?: {
+    at: number;
+    ticket: string;
+    sidcc: string;
+    page: string;
+    ticketAt?: number;
+    pageAt?: number;
+  }[];
+  lastTicketAt?: number;
+  lastSidccAt?: number;
+  lastPageAt?: number;
+  ticket?: RefreshStep;
+  sidcc?: RefreshStep;
+  page?: RefreshStep;
+}
+export interface PageDiagnostic {
+  at: number;
+  surface: "app" | "spark";
+  httpStatus?: number;
+  bytes?: number;
+  hasXsrf?: boolean;
+  hasBuild?: boolean;
+  accountMarker?: "present" | "empty" | "absent";
+  kind:
+    | "signed_in"
+    | "signed_out"
+    | "challenge"
+    | "consent"
+    | "unrecognized"
+    | "error";
+  code?: string;
+  retryAt?: number;
+  errorStatus?: number;
+}
+export interface Credentials {
+  pageDiagnostic?: PageDiagnostic;
+  importedAt?: number;
+  maintenance?: LoginMaintenance;
+  cookie: string;
+  userAgent?: string;
+  xsrf?: string;
+  bl?: string;
+  pushId?: string;
+  pctx?: string;
+  fetchedAt?: number;
+  tokenSurface?: "app" | "spark";
+  refreshedAt?: number;
+}
+export interface SparkContext {
+  conversationId: string;
+  cursor?: string;
+}
+export interface Session {
+  sparkContext?: SparkContext;
+  metadata: unknown[];
+  turn: number;
+  updatedAt: number;
+  model: string;
+}
+export interface Model {
+  id: string;
+  hex: string;
+  mode: number;
+  thinking?: boolean;
+  tool?: number;
+  spark?: boolean;
+}
+export interface InputFile {
+  data: string;
+  mime: string;
+  name: string;
+}
+export interface GenerateInput {
+  model: string;
+  prompt: string;
+  files: InputFile[];
+  stream: boolean;
+  owner: string;
+  session?: string;
+  resume?: boolean;
+  endpoint: string;
+  tools?: Tool[];
+  toolChoice?: unknown;
+  responseFormat?: unknown;
+  includeUsage?: boolean;
+}
+export interface Tool {
+  type: "function";
+  function: { name: string; description?: string; parameters?: unknown };
+}
+export interface Artifact {
+  id: string;
+  mime: string;
+  url: string;
+  owner: string;
+  expiresAt: number;
+}
+export interface Result {
+  sparkContext?: SparkContext;
+  text: string;
+  actualModel: string;
+  metadata: unknown[];
+  canvas: string;
+  urls: string[];
+  toolCalls?: unknown[];
+  artifacts?: { id: string; mime: string }[];
+}

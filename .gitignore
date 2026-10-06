@@ -1,7 +1,10 @@
-.dev.vars
-.wrangler/
 node_modules/
-
-tail.log
-
+.wrangler/
+.dev.vars*
+.env*
+!.env.example
+.local/
+coverage/
+dist/
+*.log
 wrangler.staging.toml

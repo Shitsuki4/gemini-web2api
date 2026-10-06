@@ -1,17 +1,40 @@
 {
-  "name": "gemini-web2api-worker",
-  "version": "2.0.0",
+  "name": "gemini-web2api",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare Workers port of Google Gemini web to OpenAI/Google-compatible API",
+  "description": "Gemini web protocol on Cloudflare Workers, SQLite Durable Objects and D1",
   "license": "MIT",
-  "scripts": {
-    "check": "node --check worker.js && node --check proxy/worker.js",
-    "test": "node --test",
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
-  },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "db:remote": "wrangler d1 migrations apply DB --remote",
+    "sync:roxy": "node scripts/sync-roxy.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:openai": "node scripts/smoke-openai.mjs",
+    "smoke:concurrency": "node scripts/smoke-concurrency.mjs",
+    "format": "prettier --write src tests public scripts docs README.md package.json tsconfig.json .github/workflows/ci.yml",
+    "format:check": "prettier --check src tests public scripts docs README.md package.json tsconfig.json .github/workflows/ci.yml",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "setup:secrets": "node scripts/init-secrets.mjs",
+    "smoke:media": "node scripts/smoke-media.mjs",
+    "smoke:spark": "node scripts/smoke-spark.mjs",
+    "smoke:image-chat": "node scripts/smoke-image-chat.mjs",
+    "watch:login": "node scripts/watch-login.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261004.1",
+    "esbuild": "^0.28.2",
+    "miniflare": "^4.20260730.0",
+    "prettier": "^3.9.9",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.147.0"
   }
 }
